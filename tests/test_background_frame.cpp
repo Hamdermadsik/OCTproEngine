@@ -297,6 +297,10 @@ void testSaveLoadReset(ope::Backend backend) {
 // The profile must survive a backend switch (backend -> config -> new backend)
 void testBackendSwitchTransfer() {
 	std::cout << "  Profile transfer on backend switch (CPU -> CUDA)..." << std::endl;
+	if (!ope::BackendUtils::isCudaAvailable()) {
+		std::cout << "    [SKIPPED] no CUDA device available" << std::endl;
+		return;
+	}
 
 	std::vector<float> background(SAMPLES_PER_BSCAN);
 	for (int i = 0; i < SAMPLES_PER_BSCAN; ++i) {
@@ -308,12 +312,7 @@ void testBackendSwitchTransfer() {
 	processor.initialize();
 	processor.setBackgroundFrameProfile(background.data(), SIGNAL_LENGTH, ASCANS_PER_BSCAN);
 
-	try {
-		processor.setBackend(ope::Backend::CUDA);
-	} catch (const std::exception& e) {
-		std::cout << "    [SKIPPED] CUDA not available: " << e.what() << std::endl;
-		return;
-	}
+	processor.setBackend(ope::Backend::CUDA);
 
 	std::vector<float> transferred = processor.getBackgroundFrameProfile();
 	TEST_ASSERT(transferred.size() == background.size(), "Transferred profile size must match");
@@ -325,29 +324,29 @@ void testBackendSwitchTransfer() {
 // Enabling on OpenCL/Vulkan must throw without changing configuration
 void testUnsupportedBackendRejection() {
 	std::cout << "  Unsupported backend rejection (OpenCL)..." << std::endl;
-
-	try {
-		ope::Processor processor(ope::Backend::OPENCL);
-		bool threw = false;
-		try {
-			processor.enableBackgroundFrameSubtraction(true);
-		} catch (const std::runtime_error&) {
-			threw = true;
-		}
-		TEST_ASSERT(threw, "Enabling background frame subtraction on OpenCL must throw");
-		TEST_ASSERT(!processor.getConfig().processingParams.backgroundFrame.enabled,
-			"Rejected enable must not change the configuration");
-
-		bool threwCorrection = false;
-		try {
-			processor.enablePostFftFrameCorrection(true);
-		} catch (const std::runtime_error&) {
-			threwCorrection = true;
-		}
-		TEST_ASSERT(threwCorrection, "Enabling frame correction on OpenCL must throw");
-	} catch (const std::exception& e) {
-		std::cout << "    [SKIPPED] OpenCL not available: " << e.what() << std::endl;
+	if (!ope::BackendUtils::isOpenCLAvailable()) {
+		std::cout << "    [SKIPPED] no OpenCL runtime available" << std::endl;
+		return;
 	}
+
+	ope::Processor processor(ope::Backend::OPENCL);
+	bool threw = false;
+	try {
+		processor.enableBackgroundFrameSubtraction(true);
+	} catch (const std::runtime_error&) {
+		threw = true;
+	}
+	TEST_ASSERT(threw, "Enabling background frame subtraction on OpenCL must throw");
+	TEST_ASSERT(!processor.getConfig().processingParams.backgroundFrame.enabled,
+		"Rejected enable must not change the configuration");
+
+	bool threwCorrection = false;
+	try {
+		processor.enablePostFftFrameCorrection(true);
+	} catch (const std::runtime_error&) {
+		threwCorrection = true;
+	}
+	TEST_ASSERT(threwCorrection, "Enabling frame correction on OpenCL must throw");
 }
 
 // CUDA multi-stream determinism: with continuous EMA and mid-run transitions the CUDA
@@ -389,14 +388,13 @@ void testCudaSequenceMatchesCpu() {
 		return outputs;
 	};
 
-	std::vector<std::vector<float>> cpuOutputs = runSequence(ope::Backend::CPU);
-	std::vector<std::vector<float>> cudaOutputs;
-	try {
-		cudaOutputs = runSequence(ope::Backend::CUDA);
-	} catch (const std::exception& e) {
-		std::cout << "    [SKIPPED] CUDA not available: " << e.what() << std::endl;
+	if (!ope::BackendUtils::isCudaAvailable()) {
+		std::cout << "    [SKIPPED] no CUDA device available" << std::endl;
 		return;
 	}
+
+	std::vector<std::vector<float>> cpuOutputs = runSequence(ope::Backend::CPU);
+	std::vector<std::vector<float>> cudaOutputs = runSequence(ope::Backend::CUDA);
 
 	TEST_ASSERT(cpuOutputs.size() == cudaOutputs.size(), "Both backends must deliver all buffers");
 	for (size_t n = 0; n < cpuOutputs.size(); ++n) {
@@ -423,10 +421,12 @@ int main() {
 	try {
 		runBackendSuite(ope::Backend::CPU, "CPU");
 
-		try {
+		// Availability is decided by BackendUtils, not by catching exceptions:
+		// once a backend is available, every failure inside the suite fails the test
+		if (ope::BackendUtils::isCudaAvailable()) {
 			runBackendSuite(ope::Backend::CUDA, "CUDA");
-		} catch (const std::exception& e) {
-			std::cout << "  [SKIPPED] CUDA suite: " << e.what() << std::endl;
+		} else {
+			std::cout << "  [SKIPPED] CUDA suite: no CUDA device available" << std::endl;
 		}
 
 		std::cout << "\n=== Cross-backend ===" << std::endl;

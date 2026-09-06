@@ -148,10 +148,12 @@ int main() {
 	try {
 		runBackendSuite(ope::Backend::CPU, "CPU");
 
-		try {
+		// Availability is decided by BackendUtils, not by catching exceptions:
+		// once a backend is available, every failure inside the suite fails the test
+		if (ope::BackendUtils::isCudaAvailable()) {
 			runBackendSuite(ope::Backend::CUDA, "CUDA");
-		} catch (const std::exception& e) {
-			std::cout << "  [SKIPPED] CUDA suite: " << e.what() << std::endl;
+		} else {
+			std::cout << "  [SKIPPED] CUDA suite: no CUDA device available" << std::endl;
 		}
 
 		std::cout << "\nAll frame correction tests passed" << std::endl;

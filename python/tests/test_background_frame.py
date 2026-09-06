@@ -102,14 +102,19 @@ def test_profile_roundtrip_and_reset():
         assert np.array_equal(loaded, frame), "Raw file round trip must be exact"
 
     # Wrong shape and negative values must be rejected
+    # (re-raise AssertionError so a missing rejection cannot be swallowed)
     try:
         proc.set_background_frame_profile(np.zeros((3, 3), dtype=np.float32))
         assert False, "Wrong shape must be rejected"
+    except AssertionError:
+        raise
     except Exception:
         pass
     try:
         proc.set_background_frame_profile(np.full((ASCANS_PER_BSCAN, SIGNAL_LENGTH), -1.0, dtype=np.float32))
         assert False, "Negative values must be rejected"
+    except AssertionError:
+        raise
     except Exception:
         pass
     print("  PASSED")
