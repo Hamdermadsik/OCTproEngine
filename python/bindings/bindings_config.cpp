@@ -76,6 +76,20 @@ void register_configuration(py::module& m) {
 		.def_readwrite("offset", &ope::ProcessorConfiguration::ProcessingParameters::Background::offset)
 		.def_readwrite("useCustomProfile", &ope::ProcessorConfiguration::ProcessingParameters::Background::useCustomProfile);
 
+	py::class_<ope::ProcessorConfiguration::ProcessingParameters::BackgroundFrame>(m, "ProcessingBackgroundFrame")
+		.def(py::init<>())
+		.def_readwrite("enabled", &ope::ProcessorConfiguration::ProcessingParameters::BackgroundFrame::enabled)
+		.def_readwrite("normalize", &ope::ProcessorConfiguration::ProcessingParameters::BackgroundFrame::normalize)
+		.def_readwrite("bscansToAverage", &ope::ProcessorConfiguration::ProcessingParameters::BackgroundFrame::bscansToAverage)
+		.def_readwrite("continuousUpdate", &ope::ProcessorConfiguration::ProcessingParameters::BackgroundFrame::continuousUpdate)
+		.def_readwrite("smoothSpectra", &ope::ProcessorConfiguration::ProcessingParameters::BackgroundFrame::smoothSpectra)
+		.def_readwrite("smoothingWindowRadius", &ope::ProcessorConfiguration::ProcessingParameters::BackgroundFrame::smoothingWindowRadius)
+		.def_readwrite("useCustomProfile", &ope::ProcessorConfiguration::ProcessingParameters::BackgroundFrame::useCustomProfile);
+
+	py::class_<ope::ProcessorConfiguration::ProcessingParameters::FrameCorrection>(m, "ProcessingFrameCorrection")
+		.def(py::init<>())
+		.def_readwrite("enabled", &ope::ProcessorConfiguration::ProcessingParameters::FrameCorrection::enabled);
+
 	py::class_<ope::ProcessorConfiguration::ProcessingParameters::Intensity>(m, "ProcessingIntensity")
 		.def(py::init<>())
 		.def_readwrite("logScale", &ope::ProcessorConfiguration::ProcessingParameters::Intensity::logScale)
@@ -99,6 +113,8 @@ void register_configuration(py::module& m) {
 		.def_readwrite("dispersion", &ope::ProcessorConfiguration::ProcessingParameters::dispersion)
 		.def_readwrite("fixedPatternNoise", &ope::ProcessorConfiguration::ProcessingParameters::fixedPatternNoise)
 		.def_readwrite("background", &ope::ProcessorConfiguration::ProcessingParameters::background)
+		.def_readwrite("backgroundFrame", &ope::ProcessorConfiguration::ProcessingParameters::backgroundFrame)
+		.def_readwrite("frameCorrection", &ope::ProcessorConfiguration::ProcessingParameters::frameCorrection)
 		.def_readwrite("intensity", &ope::ProcessorConfiguration::ProcessingParameters::intensity)
 		.def_readwrite("geometry", &ope::ProcessorConfiguration::ProcessingParameters::geometry);
 
@@ -125,12 +141,16 @@ void register_configuration(py::module& m) {
 		.def("setFixedPatternNoiseProfile", [](ope::ProcessorConfiguration& self, const std::vector<float>& data) {
 			self.setFixedPatternNoiseProfile(data);
 		})
+		.def("setBackgroundFrameProfile", [](ope::ProcessorConfiguration& self, const std::vector<float>& data, int samplesPerLine, int ascansPerBscan) {
+			self.setBackgroundFrameProfile(data, samplesPerLine, ascansPerBscan);
+		})
 
 		.def("getResamplingLut", &ope::ProcessorConfiguration::getResamplingLut)
 		.def("getWindowFunction", &ope::ProcessorConfiguration::getWindowFunction)
 		.def("getDispersionPhase", &ope::ProcessorConfiguration::getDispersionPhase)
 		.def("getBackgroundProfile", &ope::ProcessorConfiguration::getBackgroundProfile)
 		.def("getFixedPatternNoiseProfile", &ope::ProcessorConfiguration::getFixedPatternNoiseProfile)
+		.def("getBackgroundFrameProfile", &ope::ProcessorConfiguration::getBackgroundFrameProfile)
 
 		// Generate curves
 		.def("generateResamplingLut", &ope::ProcessorConfiguration::generateResamplingLut)
@@ -143,6 +163,7 @@ void register_configuration(py::module& m) {
 		.def("clearDispersionPhase", &ope::ProcessorConfiguration::clearDispersionPhase)
 		.def("clearBackgroundProfile", &ope::ProcessorConfiguration::clearBackgroundProfile)
 		.def("clearFixedPatternNoiseProfile", &ope::ProcessorConfiguration::clearFixedPatternNoiseProfile)
+		.def("clearBackgroundFrameProfile", &ope::ProcessorConfiguration::clearBackgroundFrameProfile)
 
 		// Adjust curves when dimensions change
 		.def("adjustAllCustomCurves", &ope::ProcessorConfiguration::adjustAllCustomCurves)

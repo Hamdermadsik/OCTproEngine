@@ -388,6 +388,96 @@ void register_processor(py::module& m) {
 			}, py::arg("filepath"), "Load an fixed-pattern noise profile from a CSV file")
 
 			// ============================================
+			// BACKGROUND FRAME SUBTRACTION (LINE-FIELD OCT)
+			// ============================================
+
+			.def("enable_background_frame_subtraction", [](ProcessorWrapper& self, bool enable) {
+				self.processor.enableBackgroundFrameSubtraction(enable);
+			}, py::arg("enable"), "Enable/disable background frame (B-scan) subtraction for line-field OCT (CPU and CUDA only)")
+
+			.def("enable_background_frame_normalization", [](ProcessorWrapper& self, bool enable) {
+				self.processor.enableBackgroundFrameNormalization(enable);
+			}, py::arg("enable"), "Enable/disable normalization by sqrt(background) during background frame subtraction")
+
+			.def("set_background_frame_bscans_to_average", [](ProcessorWrapper& self, int bscans) {
+				self.processor.setBackgroundFrameBscansToAverage(bscans);
+			}, py::arg("bscans"), "Set the number of B-scans averaged when recording (also EMA alpha = 1/bscans)")
+
+			.def("enable_continuous_background_frame_update", [](ProcessorWrapper& self, bool enable) {
+				self.processor.enableContinuousBackgroundFrameUpdate(enable);
+			}, py::arg("enable"), "Enable/disable continuous EMA update of the background frame from live data")
+
+			.def("set_background_frame_smoothing", [](ProcessorWrapper& self, bool enable, int window_radius) {
+				self.processor.setBackgroundFrameSmoothing(enable, window_radius);
+			}, py::arg("enable"), py::arg("window_radius"),
+				"Enable/disable rolling-average smoothing of the background spectra (window = 2*radius+1)")
+
+			.def("request_background_frame_recording", [](ProcessorWrapper& self) {
+				py::gil_scoped_release release;
+				self.processor.requestBackgroundFrameRecording();
+			}, "Start recording a background frame (averages the next bscans_to_average B-scans)")
+
+			.def("reset_background_frame", [](ProcessorWrapper& self) {
+				py::gil_scoped_release release;
+				self.processor.resetBackgroundFrame();
+			}, "Cancel any in-progress recording, clear the background frame and restart continuous update from zero")
+
+			.def("has_background_frame_profile", [](const ProcessorWrapper& self) {
+				return self.processor.hasBackgroundFrameProfile();
+			}, "Check if a background frame profile is currently available")
+
+			.def("get_background_frame_profile", [](const ProcessorWrapper& self) -> py::array_t<float> {
+				std::vector<float> profile;
+				{
+					py::gil_scoped_release release;
+					profile = self.processor.getBackgroundFrameProfile();
+				}
+				if (profile.empty()) {
+					throw BufferError("No background frame profile available");
+				}
+				int signalLength = self.processor.getConfig().dataParams.signalLength;
+				int ascansPerBscan = self.processor.getConfig().dataParams.ascansPerBscan;
+				py::array_t<float> result({ascansPerBscan, signalLength});
+				py::buffer_info buf = result.request();
+				std::memcpy(buf.ptr, profile.data(), profile.size() * sizeof(float));
+				return result;
+			}, "Get the current background frame as a 2D NumPy array of shape (ascans_per_bscan, signal_length)")
+
+			.def("set_background_frame_profile", [](ProcessorWrapper& self, py::array_t<float, py::array::c_style | py::array::forcecast> profile) {
+				py::buffer_info buf = profile.request();
+
+				if (buf.ndim != 2) {
+					throw BufferError("Background frame profile must be a 2D array of shape (ascans_per_bscan, signal_length)");
+				}
+
+				self.processor.setBackgroundFrameProfile(
+					static_cast<float*>(buf.ptr),
+					static_cast<size_t>(buf.shape[1]),
+					static_cast<size_t>(buf.shape[0])
+				);
+			}, py::arg("profile"), "Set the background frame from a 2D NumPy array of shape (ascans_per_bscan, signal_length)")
+
+			.def("save_background_frame_profile_to_file", [](const ProcessorWrapper& self, const std::string& filepath) {
+				try {
+					self.processor.saveBackgroundFrameProfileToFile(filepath);
+				} catch (const std::exception& e) {
+					throw ConfigurationError(std::string("Failed to save background frame profile: ") + e.what());
+				}
+			}, py::arg("filepath"), "Save the background frame profile as raw float32 binary")
+
+			.def("load_background_frame_profile_from_file", [](ProcessorWrapper& self, const std::string& filepath) {
+				try {
+					self.processor.loadBackgroundFrameProfileFromFile(filepath);
+				} catch (const std::exception& e) {
+					throw ConfigurationError(std::string("Failed to load background frame profile: ") + e.what());
+				}
+			}, py::arg("filepath"), "Load a background frame profile from raw float32 binary (size must match signal_length * ascans_per_bscan)")
+
+			.def("enable_post_fft_frame_correction", [](ProcessorWrapper& self, bool enable) {
+				self.processor.enablePostFftFrameCorrection(enable);
+			}, py::arg("enable"), "Enable/disable post-FFT frame correction (divide A-scans by sqrt of their pre-subtraction spectral average; CPU and CUDA only)")
+
+			// ============================================
 			// BACKEND-SPECIFIC SETTINGS
 			// ============================================
 
