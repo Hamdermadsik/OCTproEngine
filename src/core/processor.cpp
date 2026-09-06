@@ -541,6 +541,7 @@ void Processor::setConfig(const ProcessorConfiguration& config) {
 			this->impl->reinitialize();
 		} else {
 			// Dimensions same - just update curves and parameters
+			this->impl->backend->updateConfig(this->impl->config);
 			this->impl->updateAllBackendCurves();
 		}
 	}
