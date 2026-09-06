@@ -742,19 +742,18 @@ void renderProcessingUI(AppState* state) {
 	}
 
 	// Background Frame Subtraction (line-field OCT)
-	ImGui::SeparatorText("Background B-scan Subtraction (Line-Field OCT)");
+	ImGui::SeparatorText("Background B-scan Subtraction (Line-Field)");
 	bool lineFieldSupported = (state->dataParams.backend == ope::Backend::CPU ||
 	                           state->dataParams.backend == ope::Backend::CUDA);
 	if (!lineFieldSupported) {
 		ImGui::TextDisabled("Only supported on CPU and CUDA backends");
 	} else {
-		CheckboxWithReprocess("Enable Raw Background B-scan Subtraction", &pp.backgroundFrameSubtraction, state);
+		CheckboxWithReprocess("Enable B-scan Subtraction", &pp.backgroundFrameSubtraction, state);
 		ItemTooltip("Subtract a recorded B-scan background from the raw data before the FFT.");
 
 		int correctionMode = pp.backgroundFrameNormalize ? 1 : 0;
 		bool modeChanged = ImGui::RadioButton("Subtraction only", &correctionMode, 0);
 		ItemTooltip("Subtract the background B-scan without normalization.");
-		ImGui::SameLine();
 		modeChanged |= ImGui::RadioButton("Subtraction and normalization", &correctionMode, 1);
 		ItemTooltip("Frame normalization applied on raw data: after subtracting the background, "
 			"each sample is divided by the square root of the recorded background, using it as "
@@ -843,7 +842,7 @@ void renderProcessingUI(AppState* state) {
 		}
 
 		// Frame correction (line-field OCT)
-		ImGui::SeparatorText("Frame Correction (Line-Field OCT)");
+		ImGui::SeparatorText("Frame Correction (Line-Field)");
 		CheckboxWithReprocess("Lateral Flat-Field Correction", &pp.postFftFrameCorrection, state);
 		ItemTooltip("Equalizes brightness across the B-scan: divides each A-scan (after the FFT) "
 			"by the square root of its spectral average, computed from the live raw frame before "
