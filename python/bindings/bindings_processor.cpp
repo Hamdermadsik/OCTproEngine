@@ -437,6 +437,9 @@ void register_processor(py::module& m) {
 				}
 				int signalLength = self.processor.getConfig().dataParams.signalLength;
 				int ascansPerBscan = self.processor.getConfig().dataParams.ascansPerBscan;
+				if (profile.size() != static_cast<size_t>(signalLength) * static_cast<size_t>(ascansPerBscan)) {
+					throw BufferError("Background frame profile size does not match current input parameters");
+				}
 				py::array_t<float> result({ascansPerBscan, signalLength});
 				py::buffer_info buf = result.request();
 				std::memcpy(buf.ptr, profile.data(), profile.size() * sizeof(float));

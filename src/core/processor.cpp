@@ -307,6 +307,16 @@ public:
 		}
 	}
 
+	// The backend's live background frame is only meaningful while the geometry it was
+	// initialized with still matches the configuration (a pending lazy reinit may not
+	// have run yet). Pure metadata check - never fetches the frame from the device,
+	// so it is safe for GUI status polling
+	bool backendFrameGeometryCurrent() const {
+		return this->initialized &&
+		       this->lastInitializedDataParams.signalLength == this->config.dataParams.signalLength &&
+		       this->lastInitializedDataParams.ascansPerBscan == this->config.dataParams.ascansPerBscan;
+	}
+
 	// Pull profiles recorded by the backend into the processor configuration so they
 	// survive backend switches and are included when saving the configuration
 	void syncBackendProfilesToConfig() {
@@ -323,11 +333,14 @@ public:
 			this->config.setFixedPatternNoiseProfile(fpnProfile);
 		}
 
-		std::vector<float> frameProfile = this->backend->getBackgroundFrameProfile();
-		if (!frameProfile.empty()) {
-			this->config.setBackgroundFrameProfile(frameProfile,
-				this->config.dataParams.signalLength,
-				this->config.dataParams.ascansPerBscan);
+		// Never label a stale-geometry frame with the current dimensions
+		if (this->backendFrameGeometryCurrent()) {
+			std::vector<float> frameProfile = this->backend->getBackgroundFrameProfile();
+			if (!frameProfile.empty()) {
+				this->config.setBackgroundFrameProfile(frameProfile,
+					this->config.dataParams.signalLength,
+					this->config.dataParams.ascansPerBscan);
+			}
 		}
 	}
 
@@ -616,6 +629,7 @@ void Processor::setInputParameters(
 	DataType type)
 {
 	int oldSignalLength = this->impl->config.dataParams.signalLength;
+	int oldAscansPerBscan = this->impl->config.dataParams.ascansPerBscan;
 
 	this->impl->config.dataParams.signalLength = samplesPerRawAscan;
 	this->impl->config.dataParams.ascansPerBscan = ascansPerBscan;
@@ -624,7 +638,8 @@ void Processor::setInputParameters(
 	// samplesPerBuffer and outputSignalLength are computed properties now
 
 	// If signalLength changed, re-adjust all custom curves
-	if (samplesPerRawAscan != oldSignalLength) {
+	// (the background frame also depends on ascansPerBscan, so adjust on that change too)
+	if (samplesPerRawAscan != oldSignalLength || ascansPerBscan != oldAscansPerBscan) {
 		this->impl->config.adjustAllCustomCurves();
 
 		// Update backend with new curves if initialized
@@ -1110,8 +1125,9 @@ void Processor::setBackgroundFrameProfile(const float* data, size_t samplesPerLi
 }
 
 std::vector<float> Processor::getBackgroundFrameProfile() const {
-	// Backend has the most recent frame (it may have been recorded or EMA-updated)
-	if (this->impl->initialized) {
+	// Backend has the most recent frame (it may have been recorded or EMA-updated),
+	// but only while its initialization geometry still matches the configuration
+	if (this->impl->backendFrameGeometryCurrent()) {
 		std::vector<float> profile = this->impl->backend->getBackgroundFrameProfile();
 		if (!profile.empty()) {
 			return profile;
@@ -1122,7 +1138,7 @@ std::vector<float> Processor::getBackgroundFrameProfile() const {
 }
 
 bool Processor::hasBackgroundFrameProfile() const {
-	if (this->impl->initialized && this->impl->backend->hasBackgroundFrameProfile()) {
+	if (this->impl->backendFrameGeometryCurrent() && this->impl->backend->hasBackgroundFrameProfile()) {
 		return true;
 	}
 	return this->impl->config.hasCustomBackgroundFrameProfile();

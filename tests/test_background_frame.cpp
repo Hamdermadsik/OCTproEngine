@@ -294,6 +294,28 @@ void testSaveLoadReset(ope::Backend backend) {
 	TEST_ASSERT(processor.getBackgroundFrameProfile() == loaded, "Rejected profile must not change state");
 }
 
+// A dimension change must invalidate the frame immediately (before the lazy reinit runs)
+// and after it - including changes that keep the element count identical (equal
+// samplesPerBscan, incompatible layout)
+void testDimensionChangeInvalidatesFrame(ope::Backend backend) {
+	std::cout << "  Dimension change invalidates the frame (equal element count, before/after reinit)..." << std::endl;
+
+	ope::Processor processor(backend);
+	configurePassthrough(processor, 1);
+	processor.initialize();
+	std::vector<float> background(SAMPLES_PER_BSCAN, 100.0f);
+	processor.setBackgroundFrameProfile(background.data(), SIGNAL_LENGTH, ASCANS_PER_BSCAN);
+	TEST_ASSERT(processor.hasBackgroundFrameProfile(), "Profile must exist before the change");
+
+	// Equal element count, different layout: 2*signalLength x ascans/2
+	processor.setInputParameters(SIGNAL_LENGTH * 2, ASCANS_PER_BSCAN / 2, 1, ope::DataType::UINT16);
+	TEST_ASSERT(!processor.hasBackgroundFrameProfile(), "Stale frame must not be visible before the lazy reinit");
+	TEST_ASSERT(processor.getBackgroundFrameProfile().empty(), "Stale frame must not be returned before the lazy reinit");
+
+	processor.initialize();  // runs the pending reinitialization
+	TEST_ASSERT(!processor.hasBackgroundFrameProfile(), "Stale frame must not survive reinitialization");
+}
+
 // The profile must survive a backend switch (backend -> config -> new backend)
 void testBackendSwitchTransfer() {
 	std::cout << "  Profile transfer on backend switch (CPU -> CUDA)..." << std::endl;
@@ -414,6 +436,7 @@ void runBackendSuite(ope::Backend backend, const char* name) {
 	testSmoothing(backend);
 	testEmaBufferSemantics(backend);
 	testSaveLoadReset(backend);
+	testDimensionChangeInvalidatesFrame(backend);
 }
 
 int main() {

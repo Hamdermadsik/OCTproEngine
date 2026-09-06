@@ -2087,6 +2087,12 @@ void VulkanBackend::initialize(const ProcessorConfiguration& config) {
 		this->setFixedPatternNoiseProfile(profileVec.data(), complexPairs);
 	}
 
+	// Re-seed the host-side background frame from the configuration: clears a frame that
+	// went stale through a dimension change and restores a valid one across reinitialization
+	this->backgroundFrameProfile = config.hasCustomBackgroundFrameProfile()
+		? config.getBackgroundFrameProfile()
+		: std::vector<float>();
+
 	// Start async completion thread (handles fence polling and callbacks)
 	this->impl->completionThreadRunning = true;
 	this->impl->completionThread = std::thread(&Impl::completionThreadFunc, this->impl.get());
