@@ -308,21 +308,17 @@ public:
 	}
 
 	// Push explicitly replaced profiles from the configuration to the backend.
-	// Unchanged profiles are left alone so live (EMA-advanced or freshly recorded)
-	// calibrations survive unrelated settings changes
+	// Unchanged or absent profiles are left alone so live (EMA-advanced or freshly
+	// recorded) calibrations survive unrelated settings changes; explicit clearing
+	// goes through resetBackgroundFrame() (see the contract at setConfig())
 	void updateBackendProfilesFromConfig(bool frameReplaced, bool fpnReplaced, bool postProcBackgroundReplaced) {
 		if (!this->initialized) return;
 
-		if (frameReplaced) {
-			if (this->config.hasCustomBackgroundFrameProfile()) {
-				std::vector<float> profile = this->config.getBackgroundFrameProfile();
-				this->backend->setBackgroundFrameProfile(profile.data(),
-					static_cast<size_t>(this->config.dataParams.signalLength),
-					static_cast<size_t>(this->config.dataParams.ascansPerBscan));
-			} else {
-				// Profile explicitly removed
-				this->backend->resetBackgroundFrame();
-			}
+		if (frameReplaced && this->config.hasCustomBackgroundFrameProfile()) {
+			std::vector<float> profile = this->config.getBackgroundFrameProfile();
+			this->backend->setBackgroundFrameProfile(profile.data(),
+				static_cast<size_t>(this->config.dataParams.signalLength),
+				static_cast<size_t>(this->config.dataParams.ascansPerBscan));
 		}
 		if (fpnReplaced && this->config.hasCustomFixedPatternNoiseProfile()) {
 			std::vector<float> profile = this->config.getFixedPatternNoiseProfile();
@@ -344,29 +340,42 @@ public:
 		       this->lastInitializedDataParams.ascansPerBscan == this->config.dataParams.ascansPerBscan;
 	}
 
-	// Pull profiles recorded by the backend into the processor configuration so they
-	// survive backend switches and are included when saving the configuration
-	void syncBackendProfilesToConfig() {
+	// Pull profiles recorded by the backend into the given configuration so they
+	// survive backend switches and are included when saving the configuration.
+	// Writes go to an explicit destination so callers can use short-lived local
+	// configurations: impl->config must stay the unmodified baseline that setConfig()
+	// compares against to detect user-requested profile changes
+	void syncBackendProfilesToConfig(ProcessorConfiguration& dest) {
 		if (!this->initialized) return;
+
+		// Line profiles are only meaningful while the backend's initialized signal length
+		// matches the destination. Skipping the setter when the live profile already
+		// equals the adjusted one keeps longer originals intact (the backend only holds
+		// the adjusted copy, which must not silently become the new original)
+		bool linesCompatible =
+			this->lastInitializedDataParams.signalLength == dest.dataParams.signalLength;
 
 		// Get profiles from backend and update processor's config
 		const std::vector<float>& bgProfile = this->backend->getPostProcessBackgroundProfile();
-		if (!bgProfile.empty()) {
-			this->config.setBackgroundProfile(bgProfile);
+		if (linesCompatible && !bgProfile.empty() && bgProfile != dest.getBackgroundProfile()) {
+			dest.setBackgroundProfile(bgProfile);
 		}
 
 		const std::vector<float>& fpnProfile = this->backend->getFixedPatternNoiseProfile();
-		if (!fpnProfile.empty()) {
-			this->config.setFixedPatternNoiseProfile(fpnProfile);
+		if (linesCompatible && !fpnProfile.empty() && fpnProfile != dest.getFixedPatternNoiseProfile()) {
+			dest.setFixedPatternNoiseProfile(fpnProfile);
 		}
 
 		// Never label a stale-geometry frame with the current dimensions
-		if (this->backendFrameGeometryCurrent()) {
+		bool frameCompatible =
+			this->lastInitializedDataParams.signalLength == dest.dataParams.signalLength &&
+			this->lastInitializedDataParams.ascansPerBscan == dest.dataParams.ascansPerBscan;
+		if (frameCompatible) {
 			std::vector<float> frameProfile = this->backend->getBackgroundFrameProfile();
-			if (!frameProfile.empty()) {
-				this->config.setBackgroundFrameProfile(frameProfile,
-					this->config.dataParams.signalLength,
-					this->config.dataParams.ascansPerBscan);
+			if (!frameProfile.empty() && frameProfile != dest.getBackgroundFrameProfile()) {
+				dest.setBackgroundFrameProfile(frameProfile,
+					dest.dataParams.signalLength,
+					dest.dataParams.ascansPerBscan);
 			}
 		}
 	}
@@ -421,17 +430,23 @@ public:
 	}
 	
 	void reinitialize() {
-		if (!this->config.validate()) {
+		this->reinitialize(this->config);
+	}
+
+	// initConfig may carry live profiles preserved for the backend to restore; it must
+	// share dataParams with this->config so both describe the same geometry
+	void reinitialize(const ProcessorConfiguration& initConfig) {
+		if (!initConfig.validate()) {
 			throw std::runtime_error("Invalid processor configuration");
 		}
-		throwIfUnsupportedLineFieldFeatures(this->config, this->backendType);
+		throwIfUnsupportedLineFieldFeatures(initConfig, this->backendType);
 
 		// Restart buffer IDs like initialize() does: the backends' ordered callback
 		// delivery restarts at ID 0 after their initialization
 		this->nextBufferId = 0;
 
 		this->backend->cleanup();
-		this->backend->initialize(this->config);
+		this->backend->initialize(initConfig);
 
 		// Backend buffers were reallocated, refresh the reference tracking tables
 		// (buffer count may have changed and all buffer addresses are new)
@@ -441,7 +456,7 @@ public:
 		// Send curves to backend
 		this->updateAllBackendCurves();
 
-		this->lastInitializedDataParams = this->config.dataParams;
+		this->lastInitializedDataParams = initConfig.dataParams;
 	}
 	
 	void cleanup() {
@@ -607,8 +622,9 @@ void Processor::loadConfigurationFromFile(const std::string& filepath) {
 
 void Processor::saveConfigurationToFile(const std::string& filepath) const {
 	// Include profiles recorded by the backend since the last sync
-	this->impl->syncBackendProfilesToConfig();
-	if (!this->impl->config.saveToFile(filepath)) {
+	ProcessorConfiguration saveConfig = this->impl->config;
+	this->impl->syncBackendProfilesToConfig(saveConfig);
+	if (!saveConfig.saveToFile(filepath)) {
 		throw std::runtime_error("Failed to save configuration to: " + filepath);
 	}
 }
@@ -621,6 +637,14 @@ const ProcessorConfiguration& Processor::getConfig() const {
 	return this->impl->config;
 }
 
+// Calibration profile contract (background frame, FPN, post-process background):
+//  - absent in the incoming configuration: a compatible live calibration is preserved
+//  - present and unchanged from the previous configuration: the live calibration is
+//    preserved, including recording/EMA updates that happened since
+//  - present and changed: the supplied calibration is applied
+//  - explicit clearing goes through resetBackgroundFrame()
+//  - background frame geometry changes invalidate the incompatible frame
+// Deliberate reapplication of identical values goes through the explicit profile setters
 void Processor::setConfig(const ProcessorConfiguration& config) {
 	// Validate before committing: a rejected configuration must leave no partial state
 	if (!config.validate()) {
@@ -634,63 +658,61 @@ void Processor::setConfig(const ProcessorConfiguration& config) {
 	bool dimensionsChanged = this->impl->initialized &&
 		Impl::dataParamsRequireReinit(config.dataParams, this->impl->lastInitializedDataParams);
 
-	// A profile that differs from the previous configuration expresses intent to replace it.
-	// An unchanged profile must not overwrite a live (EMA-advanced or freshly recorded)
-	// backend calibration during an unrelated settings round trip
-	bool frameReplaced = config.getBackgroundFrameProfile() != this->impl->config.getBackgroundFrameProfile();
-	bool fpnReplaced = config.getFixedPatternNoiseProfile() != this->impl->config.getFixedPatternNoiseProfile();
-	bool postProcBackgroundReplaced = config.getBackgroundProfile() != this->impl->config.getBackgroundProfile();
+	// Replacement means present AND changed (see the contract above): an absent profile
+	// never clears or replaces a live calibration
+	bool frameReplaced = !config.getBackgroundFrameProfile().empty() &&
+		config.getBackgroundFrameProfile() != this->impl->config.getBackgroundFrameProfile();
+	bool fpnReplaced = !config.getFixedPatternNoiseProfile().empty() &&
+		config.getFixedPatternNoiseProfile() != this->impl->config.getFixedPatternNoiseProfile();
+	bool postProcBackgroundReplaced = !config.getBackgroundProfile().empty() &&
+		config.getBackgroundProfile() != this->impl->config.getBackgroundProfile();
 
 	// Copy the entire configuration (including custom curves)
 	this->impl->config = config;
+
+	// Automatically adjust all custom curves to match the new dimensions
+	// This ensures curves are always the correct size without user intervention
+	this->impl->config.adjustAllCustomCurves();
 
 	// If initialized, handle backend updates
 	if (this->impl->initialized) {
 		if (dimensionsChanged) {
 			// Preserve live backend profiles across the reinitialization where no explicit
 			// replacement takes precedence and their geometry remains valid under the new
-			// configuration (reinitialize() restores the profiles from the configuration).
-			// Deliberately NOT done on the unchanged-dimensions path: there the live
-			// profiles simply stay on the backend, and the stored configuration must keep
-			// serving as the comparison baseline for the next setConfig() call
+			// configuration. The snapshot goes into a short-lived local configuration that
+			// only the backend initializes from: impl->config must stay the user-supplied
+			// comparison baseline for the next setConfig() call
+			ProcessorConfiguration initConfig = this->impl->config;
 			bool liveLinesCompatible =
 				this->impl->lastInitializedDataParams.signalLength == config.dataParams.signalLength;
 			if (!frameReplaced && this->impl->backendFrameGeometryCurrent()) {
 				std::vector<float> liveFrame = this->impl->backend->getBackgroundFrameProfile();
 				if (!liveFrame.empty()) {
-					this->impl->config.setBackgroundFrameProfile(liveFrame,
+					initConfig.setBackgroundFrameProfile(liveFrame,
 						config.dataParams.signalLength, config.dataParams.ascansPerBscan);
 				}
 			}
 			if (!fpnReplaced && liveLinesCompatible) {
 				const std::vector<float>& liveFpn = this->impl->backend->getFixedPatternNoiseProfile();
 				if (!liveFpn.empty()) {
-					this->impl->config.setFixedPatternNoiseProfile(liveFpn);
+					initConfig.setFixedPatternNoiseProfile(liveFpn);
 				}
 			}
 			if (!postProcBackgroundReplaced && liveLinesCompatible) {
 				const std::vector<float>& liveBg = this->impl->backend->getPostProcessBackgroundProfile();
 				if (!liveBg.empty()) {
-					this->impl->config.setBackgroundProfile(liveBg);
+					initConfig.setBackgroundProfile(liveBg);
 				}
 			}
 
-			// Automatically adjust all custom curves to match the new dimensions
-			// This ensures curves are always the correct size without user intervention
-			this->impl->config.adjustAllCustomCurves();
-
 			// Dimensions changed - must reinitialize backend
-			this->impl->reinitialize();
+			this->impl->reinitialize(initConfig);
 		} else {
 			// Dimensions same - just update curves and parameters
-			this->impl->config.adjustAllCustomCurves();
 			this->impl->backend->updateConfig(this->impl->config);
 			this->impl->updateAllBackendCurves();
 			this->impl->updateBackendProfilesFromConfig(frameReplaced, fpnReplaced, postProcBackgroundReplaced);
 		}
-	} else {
-		// Automatically adjust all custom curves to match the new dimensions
-		this->impl->config.adjustAllCustomCurves();
 	}
 	// If not initialized, config is just stored and will be used during initialize()
 }
@@ -731,8 +753,9 @@ void Processor::setInputParameters(
 	if (this->impl->initialized && this->impl->needsReinit()) {
 		// Preserve live backend profiles that remain geometry-compatible (the sync is
 		// geometry-guarded); reinitialize() restores them from the configuration
-		this->impl->syncBackendProfilesToConfig();
-		this->impl->reinitialize();
+		ProcessorConfiguration initConfig = this->impl->config;
+		this->impl->syncBackendProfilesToConfig(initConfig);
+		this->impl->reinitialize(initConfig);
 	}
 }
 
@@ -760,8 +783,10 @@ void Processor::setBackend(Backend backend) {
 	bool wasInitialized = this->impl->initialized;
 
 	// Sync backend's recorded profiles to processor's config before cleanup
+	// (via a local transfer configuration so impl->config stays the comparison baseline)
+	ProcessorConfiguration transferConfig = this->impl->config;
 	if (this->impl->initialized) {
-		this->impl->syncBackendProfilesToConfig();
+		this->impl->syncBackendProfilesToConfig(transferConfig);
 
 		// Clean up old backend
 		this->impl->backend->cleanup();
@@ -774,7 +799,7 @@ void Processor::setBackend(Backend backend) {
 	// If old backend was initialized, initialize new backend with config
 	// The new backend will load any recorded profiles from config during initialization
 	if (wasInitialized) {
-		this->impl->backend->initialize(this->impl->config);
+		this->impl->backend->initialize(transferConfig);
 
 		// Set buffer count from backend before setting callbacks
 		this->impl->outputBufferManager.setBufferCount(this->impl->backend->getOutputBufferCount());
@@ -1231,11 +1256,12 @@ bool Processor::hasBackgroundFrameProfile() const {
 
 void Processor::saveBackgroundFrameProfileToFile(const std::string& filepath) const {
 	// Snapshot the current frame from the backend first (it may have been recorded or EMA-updated)
-	this->impl->syncBackendProfilesToConfig();
-	if (!this->impl->config.hasCustomBackgroundFrameProfile()) {
+	ProcessorConfiguration snapshot = this->impl->config;
+	this->impl->syncBackendProfilesToConfig(snapshot);
+	if (!snapshot.hasCustomBackgroundFrameProfile()) {
 		throw std::runtime_error("No background frame profile to save");
 	}
-	if (!this->impl->config.saveBackgroundFrameProfileToFile(filepath)) {
+	if (!snapshot.saveBackgroundFrameProfileToFile(filepath)) {
 		throw std::runtime_error("Failed to save background frame profile to: " + filepath);
 	}
 }

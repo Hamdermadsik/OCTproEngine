@@ -174,6 +174,12 @@ def test_config_copy_and_type_change():
     buffer = proc.get_next_available_buffer()
     assert buffer.nbytes == SAMPLES_PER_BSCAN, \
         f"Buffer must be uint8-sized ({SAMPLES_PER_BSCAN} bytes), got {buffer.nbytes}"
+
+    # The copy/apply idiom must deliver custom curves (mirrors example_load_raw_file.py)
+    cfg = proc.config
+    cfg.setResamplingLut([float(i) for i in range(SIGNAL_LENGTH)])
+    proc.set_config(cfg)
+    proc.use_custom_resampling_curve(True)  # must not raise "No custom resampling curve set"
     print("  PASSED")
 
 

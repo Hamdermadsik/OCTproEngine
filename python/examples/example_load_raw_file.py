@@ -119,9 +119,11 @@ def configure_processor(processor):
         processor.set_grayscale_range(min=GRAYSCALE_MIN, max=GRAYSCALE_MAX)
 
     if RESAMPLING_LUT_FILE is not None:
-        ok = processor.config.loadResamplingLutFromFile(str(RESAMPLING_LUT_FILE))
-        if not ok:
+        # processor.config returns a copy: modify it and apply with set_config()
+        cfg = processor.config
+        if not cfg.loadResamplingLutFromFile(str(RESAMPLING_LUT_FILE)):
             raise RuntimeError(f"Failed to load resampling LUT: {RESAMPLING_LUT_FILE}")
+        processor.set_config(cfg)
         processor.enable_resampling(True)
         processor.use_custom_resampling_curve(True)
 

@@ -353,6 +353,117 @@ void testSaveLoadReset(ope::Backend backend) {
 	TEST_ASSERT(processor.getBackgroundFrameProfile() == loaded, "Rejected profile must not change state");
 }
 
+// 1D profile originals must survive a signal length round trip (shrink -> grow), and a
+// configuration save at the smaller size must not overwrite the longer originals with
+// the backend's truncated copies
+void testProfileOriginalsSurviveResize(ope::Backend backend) {
+	std::cout << "  1D profile originals survive a signal length round trip..." << std::endl;
+
+	ope::Processor processor(backend);
+	configurePassthrough(processor, 1);
+	processor.initialize();
+
+	// Post-process background and FPN profiles with distinctive ramps
+	std::vector<float> bgProfile(SIGNAL_LENGTH / 2);
+	for (size_t i = 0; i < bgProfile.size(); ++i) bgProfile[i] = static_cast<float>(i + 1);
+	processor.setPostProcessBackgroundProfile(bgProfile.data(), bgProfile.size());
+
+	std::vector<float> fpnProfile(SIGNAL_LENGTH);  // signalLength/2 complex pairs, interleaved
+	for (size_t i = 0; i < fpnProfile.size(); ++i) fpnProfile[i] = static_cast<float>(i + 1) * 0.5f;
+	processor.setFixedPatternNoiseProfile(fpnProfile.data(), fpnProfile.size() / 2);
+
+	// Shrink, save a configuration snapshot while small, then grow back
+	processor.setInputParameters(SIGNAL_LENGTH / 2, ASCANS_PER_BSCAN, 1, ope::DataType::UINT16);
+	const std::string filepath = "test_resize_config.ini";
+	processor.saveConfigurationToFile(filepath);
+	std::remove(filepath.c_str());
+	processor.setInputParameters(SIGNAL_LENGTH, ASCANS_PER_BSCAN, 1, ope::DataType::UINT16);
+
+	const float* restoredBg = processor.getPostProcessBackgroundProfile();
+	size_t restoredBgSize = processor.getPostProcessBackgroundProfileSize();
+	TEST_ASSERT(restoredBg != nullptr && restoredBgSize == bgProfile.size(),
+		"Post-process background profile must be restored at the original length");
+	for (size_t i = 0; i < bgProfile.size(); ++i) {
+		TEST_ASSERT(restoredBg[i] == bgProfile[i],
+			"Post-process background tail must recover its original values, not zeros");
+	}
+
+	const float* restoredFpn = processor.getFixedPatternNoiseProfile();
+	size_t restoredFpnPairs = processor.getFixedPatternNoiseProfileSize();
+	TEST_ASSERT(restoredFpn != nullptr && restoredFpnPairs * 2 == fpnProfile.size(),
+		"FPN profile must be restored at the original length");
+	for (size_t i = 0; i < fpnProfile.size(); ++i) {
+		TEST_ASSERT(restoredFpn[i] == fpnProfile[i],
+			"FPN tail must recover its original values, not zeros");
+	}
+}
+
+// The comparison baseline must not change through preservation snapshots: reapplying
+// the same configuration after a reinitialization must never reset or clear the
+// live calibration
+void testCalibrationSurvivesReinitRoundTrips(ope::Backend backend) {
+	std::cout << "  Calibration survives repeated configuration round trips with reinit..." << std::endl;
+
+	// Initially absent frame: EMA reaches 50, change B-scan count, apply the same copy twice
+	{
+		ope::Processor processor(backend);
+		configurePassthrough(processor, 1);
+		processor.setBackgroundFrameBscansToAverage(2);  // alpha = 1/2
+		processor.enableBackgroundFrameSubtraction(true);
+		processor.enableContinuousBackgroundFrameUpdate(true);
+		processor.initialize();
+
+		processBuffers(processor, {makeConstantBscans({100})}, 1);  // EMA: 0 -> 50
+
+		ope::ProcessorConfiguration copy = processor.getConfig();
+		copy.dataParams.bscansPerBuffer = 2;
+		processor.setConfig(copy);
+		processor.setConfig(copy);
+
+		std::vector<float> profile = processor.getBackgroundFrameProfile();
+		TEST_ASSERT(!profile.empty() && nearlyEqual(profile[0], 50.0f, 0.01f),
+			"Live frame must remain 50 after applying the same configuration twice");
+	}
+
+	// Configured seed 100: EMA advances to 150, reinitialize, reapply the same configuration
+	{
+		ope::Processor processor(backend);
+		configurePassthrough(processor, 1);
+		processor.setBackgroundFrameBscansToAverage(2);  // alpha = 1/2
+		processor.initialize();
+		std::vector<float> seed(SAMPLES_PER_BSCAN, 100.0f);
+		processor.setBackgroundFrameProfile(seed.data(), SIGNAL_LENGTH, ASCANS_PER_BSCAN);
+		processor.enableBackgroundFrameSubtraction(true);
+		processor.enableContinuousBackgroundFrameUpdate(true);
+
+		processBuffers(processor, {makeConstantBscans({200})}, 1);  // EMA: 100 -> 150
+
+		ope::ProcessorConfiguration copy = processor.getConfig();
+		copy.dataParams.bscansPerBuffer = 2;
+		processor.setConfig(copy);  // reinitialization must preserve the live 150
+		processor.setConfig(copy);  // reapplying the same copy must keep 150 too
+
+		std::vector<float> profile = processor.getBackgroundFrameProfile();
+		TEST_ASSERT(!profile.empty() && nearlyEqual(profile[0], 150.0f, 0.01f),
+			"Live frame must remain 150 after reinitialization and reapplication");
+	}
+
+	// Explicit reset followed by a fresh configuration round trip stays cleared
+	{
+		ope::Processor processor(backend);
+		configurePassthrough(processor, 1);
+		processor.initialize();
+		std::vector<float> seed(SAMPLES_PER_BSCAN, 100.0f);
+		processor.setBackgroundFrameProfile(seed.data(), SIGNAL_LENGTH, ASCANS_PER_BSCAN);
+		processor.resetBackgroundFrame();
+
+		ope::ProcessorConfiguration copy = processor.getConfig();
+		processor.setConfig(copy);
+		TEST_ASSERT(!processor.hasBackgroundFrameProfile(),
+			"Background must remain cleared after reset and a configuration round trip");
+	}
+}
+
 // Output delivery must continue after a mid-session reinitialization: the backends'
 // ordered callback delivery restarts at buffer ID 0, so the processor must restart
 // its buffer IDs too
@@ -753,6 +864,8 @@ void runBackendSuite(ope::Backend backend, const char* name) {
 	testSetConfigProfileHandling(backend);
 	testReinitializeKeepsDelivering(backend);
 	testSetInputParametersPreservesFrame(backend);
+	testProfileOriginalsSurviveResize(backend);
+	testCalibrationSurvivesReinitRoundTrips(backend);
 }
 
 int main() {
