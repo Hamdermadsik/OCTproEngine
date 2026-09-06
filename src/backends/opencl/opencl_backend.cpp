@@ -870,6 +870,11 @@ void OpenClBackend::initialize(const ProcessorConfiguration& config) {
 			this->impl->signalLength * 2 * sizeof(float), hostMeanInterleaved.data(), 0, nullptr, nullptr));
 		this->impl->fixedPatternNoiseDetermined = true;
 	}
+	// Re-seed the host-side background frame from the configuration: clears a frame that
+	// went stale through a dimension change and restores a valid one across reinitialization
+	this->backgroundFrameProfile = config.hasCustomBackgroundFrameProfile()
+		? config.getBackgroundFrameProfile()
+		: std::vector<float>();
 
 	//	Start callback worker thread for ordered callback delivery
 	//	Multiple command queues can complete out of order, this ensures callbacks are delivered in submission order
@@ -1515,7 +1520,9 @@ void OpenClBackend::updateConfig(const ProcessorConfiguration& config) {
 }
 
 void OpenClBackend::updateResamplingCurve(const float* curve, size_t length) {
-	if (!this->impl->openclInitialized) {
+	// Mismatched lengths are dropped: they occur when parameters changed but the
+	// pending reinitialization has not run yet (which re-sends all curves)
+	if (!this->impl->openclInitialized || length != static_cast<size_t>(this->impl->signalLength)) {
 		return;
 	}
 
@@ -1525,7 +1532,8 @@ void OpenClBackend::updateResamplingCurve(const float* curve, size_t length) {
 }
 
 void OpenClBackend::updateDispersionCurve(const float* curve, size_t length) {
-	if (!this->impl->openclInitialized) {
+	// Curve is interleaved real/imag, so the expected length is 2 * signalLength
+	if (!this->impl->openclInitialized || length != static_cast<size_t>(this->impl->signalLength) * 2) {
 		return;
 	}
 
@@ -1535,7 +1543,7 @@ void OpenClBackend::updateDispersionCurve(const float* curve, size_t length) {
 }
 
 void OpenClBackend::updateWindowCurve(const float* curve, size_t length) {
-	if (!this->impl->openclInitialized) {
+	if (!this->impl->openclInitialized || length != static_cast<size_t>(this->impl->signalLength)) {
 		return;
 	}
 

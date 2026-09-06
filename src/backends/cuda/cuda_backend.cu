@@ -1258,9 +1258,12 @@ void CudaBackend::updateResamplingCurve(const float* curve, size_t length) {
 }
 
 void CudaBackend::updateDispersionCurve(const float* curve, size_t length) {
-    if (this->impl->d_phaseCartesian == nullptr) {
-        return;
-    }
+	// Curve is interleaved real/imag, so the expected length is 2 * signalLength.
+	// Mismatched lengths are dropped: they occur when parameters changed but the
+	// pending reinitialization has not run yet (which re-sends all curves)
+	if (this->impl->d_phaseCartesian == nullptr || length != static_cast<size_t>(this->impl->signalLength) * 2) {
+		return;
+	}
 
 	// Set CUDA device for this processor instance (required for multi-device support)
 	checkCudaErrors(cudaSetDevice(this->impl->deviceId));
