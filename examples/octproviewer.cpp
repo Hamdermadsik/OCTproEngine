@@ -559,6 +559,17 @@ bool CheckboxWithReprocess(const char* label, bool* v, AppState* state) {
 	return false;
 }
 
+// Word-wrapped tooltip for the previously rendered item
+void ItemTooltip(const char* text) {
+	if (ImGui::IsItemHovered()) {
+		ImGui::BeginTooltip();
+		ImGui::PushTextWrapPos(ImGui::GetFontSize() * 30.0f);
+		ImGui::TextUnformatted(text);
+		ImGui::PopTextWrapPos();
+		ImGui::EndTooltip();
+	}
+}
+
 bool InputFloatWithReprocess(const char* label, float* v, AppState* state,
 					         float step = 1.0f, const char* format = "%.6f") {
 	if (ImGui::InputFloat(label, v, step, step, format)) {
@@ -731,24 +742,46 @@ void renderProcessingUI(AppState* state) {
 	}
 
 	// Background Frame Subtraction (line-field OCT)
-	ImGui::SeparatorText("Background Frame (Line-Field)");
+	ImGui::SeparatorText("Background B-scan Subtraction (Line-Field OCT)");
 	bool lineFieldSupported = (state->dataParams.backend == ope::Backend::CPU ||
 	                           state->dataParams.backend == ope::Backend::CUDA);
 	if (!lineFieldSupported) {
 		ImGui::TextDisabled("Only supported on CPU and CUDA backends");
 	} else {
-		CheckboxWithReprocess("Enable Frame Subtraction", &pp.backgroundFrameSubtraction, state);
-		CheckboxWithReprocess("Normalize by sqrt(Background)", &pp.backgroundFrameNormalize, state);
+		CheckboxWithReprocess("Enable Raw Background B-scan Subtraction", &pp.backgroundFrameSubtraction, state);
+		ItemTooltip("Subtract a recorded B-scan background from the raw data before the FFT.");
+
+		int correctionMode = pp.backgroundFrameNormalize ? 1 : 0;
+		bool modeChanged = ImGui::RadioButton("Subtraction only", &correctionMode, 0);
+		ItemTooltip("Subtract the background B-scan without normalization.");
+		ImGui::SameLine();
+		modeChanged |= ImGui::RadioButton("Subtraction and normalization", &correctionMode, 1);
+		ItemTooltip("Frame normalization applied on raw data: after subtracting the background, "
+			"each sample is divided by the square root of the recorded background, using it as "
+			"the illumination reference to equalize brightness across the B-scan. "
+			"Requires a recorded background. Alternative: Lateral Flat-Field Correction below, "
+			"which needs no recorded background.");
+		if (modeChanged) {
+			pp.backgroundFrameNormalize = (correctionMode == 1);
+			if (state->autoUpdate) reprocessData(state);
+		}
+
 		if (ImGui::InputInt("B-scans to Average", &pp.backgroundFrameBscansToAverage, 1, 1)) {
 			if (pp.backgroundFrameBscansToAverage < 1) pp.backgroundFrameBscansToAverage = 1;
 			if (state->autoUpdate) reprocessData(state);
 		}
-		CheckboxWithReprocess("Smooth Background Spectra", &pp.backgroundFrameSmoothing, state);
-		if (ImGui::InputInt("Smoothing Radius", &pp.backgroundFrameSmoothingRadius, 1, 1)) {
+		ItemTooltip("Number of B-scans captured and averaged when recording a background.");
+
+		CheckboxWithReprocess("Smooth spectra", &pp.backgroundFrameSmoothing, state);
+		ItemTooltip("Smooth each A-scan's background spectrum with a rolling average filter. "
+			"Correction then uses the smoothed background frame instead of the raw one. "
+			"This can be helpful when imaging static samples.");
+		if (ImGui::InputInt("Smoothing Window", &pp.backgroundFrameSmoothingRadius, 1, 1)) {
 			if (pp.backgroundFrameSmoothingRadius < 0) pp.backgroundFrameSmoothingRadius = 0;
 			if (state->autoUpdate) reprocessData(state);
 		}
-		if (ImGui::Button("Record Background Frame", ImVec2(-1, 0))) {
+		ItemTooltip("Half-width of the rolling average window in samples (total window = 2*value+1).");
+		if (ImGui::Button("Record Background", ImVec2(-1, 0))) {
 			if (state->processorInitialized && state->hasDataLoaded) {
 				// Apply the current averaging setting first: the recording target is
 				// latched at request time (Auto Update may not have pushed it yet)
@@ -764,14 +797,17 @@ void renderProcessingUI(AppState* state) {
 				}
 			}
 		}
-		if (ImGui::Button("Reset Background Frame", ImVec2(-1, 0))) {
+		ItemTooltip("Capture and average N B-scans. Note: with a looped file this records "
+			"the displayed data itself, so subtraction will mostly null the image.");
+		if (ImGui::Button("Reset Background", ImVec2(-1, 0))) {
 			if (state->processorInitialized) {
 				state->processor->resetBackgroundFrame();
 				if (state->autoUpdate) reprocessData(state);
 			}
 		}
+		ItemTooltip("Cancel a running recording and clear the background.");
 #ifdef _WIN32
-		if (ImGui::Button("Save Background Frame...", ImVec2(-1, 0))) {
+		if (ImGui::Button("Save Background...", ImVec2(-1, 0))) {
 			if (state->processorInitialized && state->processor->hasBackgroundFrameProfile()) {
 				char path[512];
 				if (browseForSaveFile(path, sizeof(path), "background_frame.raw", "Save background frame")) {
@@ -784,7 +820,8 @@ void renderProcessingUI(AppState* state) {
 				}
 			}
 		}
-		if (ImGui::Button("Load Background Frame...", ImVec2(-1, 0))) {
+		ItemTooltip("Raw float32 file, size must match signal length x A-scans per B-scan.");
+		if (ImGui::Button("Load Background...", ImVec2(-1, 0))) {
 			if (state->processorInitialized) {
 				char path[512];
 				if (browseForOpenFile(path, sizeof(path), "Load background frame")) {
@@ -797,16 +834,21 @@ void renderProcessingUI(AppState* state) {
 				}
 			}
 		}
+		ItemTooltip("Raw float32 file, size must match signal length x A-scans per B-scan.");
 #endif
 		if (state->processorInitialized && state->processor->hasBackgroundFrameProfile()) {
-			ImGui::Text("Background frame: available");
+			ImGui::Text("Status: Background active");
 		} else {
-			ImGui::TextDisabled("Background frame: none");
+			ImGui::TextDisabled("Status: No background loaded");
 		}
 
-		// Post-FFT Frame Correction (line-field OCT)
-		ImGui::SeparatorText("Post-FFT Frame Correction (Line-Field)");
-		CheckboxWithReprocess("Enable Frame Correction", &pp.postFftFrameCorrection, state);
+		// Frame correction (line-field OCT)
+		ImGui::SeparatorText("Frame Correction (Line-Field OCT)");
+		CheckboxWithReprocess("Lateral Flat-Field Correction", &pp.postFftFrameCorrection, state);
+		ItemTooltip("Equalizes brightness across the B-scan: divides each A-scan (after the FFT) "
+			"by the square root of its spectral average, computed from the live raw frame before "
+			"background subtraction. No recorded background required. This is an alternative to "
+			"the frame normalization applied on raw data ('Subtraction and normalization' above).");
 	}
 
 	ImGui::SeparatorText("Misc");
