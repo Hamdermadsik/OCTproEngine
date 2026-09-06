@@ -542,6 +542,40 @@ void testUnsupportedBackendRejection() {
 	TEST_ASSERT(threwCorrection, "Enabling frame correction on OpenCL must throw");
 }
 
+// Reset must work on passive backends, and a rejected backend switch must leave
+// backend and stored backend configuration consistent
+void testResetAndRejectedSwitchConsistency() {
+	std::cout << "  Reset on passive backends and rejected setBackendConfig()..." << std::endl;
+
+	ope::Processor processor(ope::Backend::CPU);
+	configurePassthrough(processor, 1);
+	processor.enableBackgroundFrameSubtraction(true);
+	bool threw = false;
+	try {
+		processor.setBackendConfig(ope::OpenCLConfig());
+	} catch (const std::runtime_error&) {
+		threw = true;
+	}
+	TEST_ASSERT(threw, "setBackendConfig() to an unsupported backend must throw");
+	TEST_ASSERT(processor.getBackend() == ope::Backend::CPU, "Backend must remain CPU");
+	auto backendConfig = processor.getBackendConfig();
+	TEST_ASSERT(backendConfig && backendConfig->getBackendType() == ope::Backend::CPU,
+		"Stored backend configuration must match the actual backend");
+
+	// Passive profile storage and reset work without processing support
+	if (ope::BackendUtils::isOpenCLAvailable()) {
+		ope::Processor passive(ope::Backend::OPENCL);
+		passive.setInputParameters(SIGNAL_LENGTH, ASCANS_PER_BSCAN, 1, ope::DataType::UINT16);
+		std::vector<float> frame(SAMPLES_PER_BSCAN, 5.0f);
+		passive.setBackgroundFrameProfile(frame.data(), SIGNAL_LENGTH, ASCANS_PER_BSCAN);
+		TEST_ASSERT(passive.hasBackgroundFrameProfile(), "Passive profile must be stored");
+		passive.resetBackgroundFrame();
+		TEST_ASSERT(!passive.hasBackgroundFrameProfile(), "Reset must clear the passive profile");
+	} else {
+		std::cout << "    [SKIPPED] passive reset: no OpenCL runtime available" << std::endl;
+	}
+}
+
 // CUDA multi-stream determinism: with continuous EMA and mid-run transitions the CUDA
 // output sequence (3 streams by default) must match the strictly serial CPU backend
 void testCudaSequenceMatchesCpu() {
@@ -630,6 +664,7 @@ int main() {
 		testValidationRejection();
 		testBackendSwitchTransfer();
 		testUnsupportedBackendRejection();
+		testResetAndRejectedSwitchConsistency();
 		testCudaSequenceMatchesCpu();
 
 		std::cout << "\nAll background frame tests passed" << std::endl;

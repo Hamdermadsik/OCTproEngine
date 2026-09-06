@@ -1154,7 +1154,8 @@ void Processor::requestBackgroundFrameRecording() {
 }
 
 void Processor::resetBackgroundFrame() {
-	Impl::throwIfLineFieldUnsupported(this->impl->backendType);
+	// Works on every backend: OpenCL/Vulkan store the profile host-side and must be
+	// able to clear it even though they do not process the feature yet
 	this->impl->backend->resetBackgroundFrame();
 	// Also clear the configuration copy so getters do not fall back to the old profile
 	this->impl->config.clearBackgroundFrameProfile();
@@ -1570,11 +1571,21 @@ void Processor::setBackendConfig(const BackendConfig& config) {
 	// Check if we need to switch backends
 	Backend newBackend = config.getBackendType();
 	if (this->impl->backendType != newBackend) {
+		// Validate before committing: the new backend must support all enabled features
+		Impl::throwIfUnsupportedLineFieldFeatures(this->impl->config, newBackend);
+
 		// Store new configuration
 		this->impl->backendConfig = config.clone();
 
 		// Switch backend (this will preserve all processing configuration)
-		this->setBackend(newBackend);
+		try {
+			this->setBackend(newBackend);
+		} catch (...) {
+			// Keep the stored configuration consistent with the backend that actually
+			// exists (general rollback of a partially destroyed backend is out of scope)
+			this->impl->backendConfig = BackendUtils::createDefaultConfig(this->impl->backendType);
+			throw;
+		}
 	} else {
 		// Same backend, just update configuration
 		if (this->impl->initialized) {
