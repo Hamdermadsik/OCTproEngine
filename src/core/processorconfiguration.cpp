@@ -182,6 +182,14 @@ void ProcessorConfiguration::setBackgroundFrameProfile(const std::vector<float>&
 		this->clearBackgroundFrameProfile();
 		return;
 	}
+	// Reject invalid values without touching the stored profile: clearing or clamping
+	// would silently destroy calibration data, and negative values would produce NaN
+	// in the sqrt-based normalization
+	for (float value : data) {
+		if (!std::isfinite(value) || value < 0.0f) {
+			throw std::invalid_argument("Background frame profile contains a negative or non-finite value");
+		}
+	}
 	this->impl->backgroundFrameProfile = data;
 	this->impl->backgroundFrameSamplesPerLine = samplesPerLine;
 	this->impl->backgroundFrameAscansPerBscan = ascansPerBscan;

@@ -9,6 +9,8 @@
 #include <cstring>
 #include <cstdio>
 #include <cmath>
+#include <fstream>
+#include <limits>
 
 // Tests for background frame (B-scan) subtraction for line-field OCT.
 // Uses linear intensity scaling with passthrough parameters (min=0, max=1, coeff=1, addend=0)
@@ -294,6 +296,120 @@ void testSaveLoadReset(ope::Backend backend) {
 	TEST_ASSERT(processor.getBackgroundFrameProfile() == loaded, "Rejected profile must not change state");
 }
 
+// setConfig() profile semantics: an explicitly replaced profile must reach the backend,
+// an unchanged profile must not overwrite a live EMA-advanced calibration, and a
+// bscansPerBuffer-only change must preserve the live frame across reinitialization
+void testSetConfigProfileHandling(ope::Backend backend) {
+	std::cout << "  setConfig() profile replacement / preservation..." << std::endl;
+
+	// Replacement: frame 100 live, config carries frame 300 -> constant 1000 gives DC 1400
+	{
+		ope::Processor processor(backend);
+		configurePassthrough(processor, 1);
+		processor.initialize();
+		std::vector<float> oldFrame(SAMPLES_PER_BSCAN, 100.0f);
+		processor.setBackgroundFrameProfile(oldFrame.data(), SIGNAL_LENGTH, ASCANS_PER_BSCAN);
+		processor.enableBackgroundFrameSubtraction(true);
+
+		ope::ProcessorConfiguration config = processor.getConfig();
+		config.setBackgroundFrameProfile(std::vector<float>(SAMPLES_PER_BSCAN, 300.0f), SIGNAL_LENGTH, ASCANS_PER_BSCAN);
+		processor.setConfig(config);
+
+		auto output = processBuffers(processor, {makeConstantBscans({1000})}, 1);
+		TEST_ASSERT(nearlyEqual(output[0][0], 2.0f * (1000.0f - 300.0f), 0.01f),
+			"A replaced profile in setConfig() must reach the backend");
+	}
+
+	// Preservation: an unrelated settings round trip must not reset a live EMA background
+	{
+		ope::Processor processor(backend);
+		configurePassthrough(processor, 1);
+		processor.setBackgroundFrameBscansToAverage(2);  // alpha = 1/2
+		processor.enableBackgroundFrameSubtraction(true);
+		processor.enableContinuousBackgroundFrameUpdate(true);
+		processor.initialize();
+
+		std::vector<uint16_t> data = makeConstantBscans({100});
+		processBuffers(processor, {data, data}, 1);  // live background: 0 -> 50 -> 75
+
+		ope::ProcessorConfiguration config = processor.getConfig();
+		config.processingParams.dcRemoval.windowSize = 32;  // unrelated change
+		processor.setConfig(config);
+
+		std::vector<float> profile = processor.getBackgroundFrameProfile();
+		TEST_ASSERT(nearlyEqual(profile[0], 75.0f, 0.01f),
+			"An unrelated setConfig() round trip must preserve the live EMA background");
+
+		processBuffers(processor, {data}, 1);  // EMA must continue from 75, not restart
+		profile = processor.getBackgroundFrameProfile();
+		TEST_ASSERT(nearlyEqual(profile[0], 87.5f, 0.01f),
+			"EMA must continue from the preserved background after the round trip");
+	}
+
+	// Geometry-compatible reinitialization: bscansPerBuffer change keeps the frame
+	{
+		ope::Processor processor(backend);
+		configurePassthrough(processor, 1);
+		processor.initialize();
+		std::vector<float> frame(SAMPLES_PER_BSCAN, 100.0f);
+		processor.setBackgroundFrameProfile(frame.data(), SIGNAL_LENGTH, ASCANS_PER_BSCAN);
+
+		ope::ProcessorConfiguration config = processor.getConfig();
+		config.dataParams.bscansPerBuffer = 2;
+		processor.setConfig(config);
+
+		std::vector<float> preserved = processor.getBackgroundFrameProfile();
+		TEST_ASSERT(preserved.size() == static_cast<size_t>(SAMPLES_PER_BSCAN),
+			"Frame must survive a bscansPerBuffer-only reinitialization");
+		TEST_ASSERT(nearlyEqual(preserved[0], 100.0f, 0.0001f), "Preserved frame values must match");
+	}
+}
+
+// Invalid configurations and profile files must be rejected without partial state
+void testValidationRejection() {
+	std::cout << "  Validation: invalid setConfig() and NaN profile file rejected..." << std::endl;
+
+	ope::Processor processor(ope::Backend::CPU);
+	configurePassthrough(processor, 1);
+	processor.initialize();
+
+	// bscansToAverage = 0 must be rejected before any state changes
+	ope::ProcessorConfiguration config = processor.getConfig();
+	config.processingParams.backgroundFrame.bscansToAverage = 0;
+	bool threw = false;
+	try {
+		processor.setConfig(config);
+	} catch (const std::invalid_argument&) {
+		threw = true;
+	}
+	TEST_ASSERT(threw, "setConfig() with bscansToAverage = 0 must throw");
+	TEST_ASSERT(processor.getConfig().processingParams.backgroundFrame.bscansToAverage != 0,
+		"Rejected setConfig() must leave the configuration unchanged");
+
+	// A correctly sized raw file containing NaN must be rejected, keeping the old profile
+	std::vector<float> validFrame(SAMPLES_PER_BSCAN, 42.0f);
+	processor.setBackgroundFrameProfile(validFrame.data(), SIGNAL_LENGTH, ASCANS_PER_BSCAN);
+
+	const std::string filepath = "test_background_frame_nan.raw";
+	{
+		std::vector<float> nanFrame(SAMPLES_PER_BSCAN, std::numeric_limits<float>::quiet_NaN());
+		std::ofstream file(filepath, std::ios::binary);
+		file.write(reinterpret_cast<const char*>(nanFrame.data()), nanFrame.size() * sizeof(float));
+	}
+
+	bool loadThrew = false;
+	try {
+		processor.loadBackgroundFrameProfileFromFile(filepath);
+	} catch (const std::exception&) {
+		loadThrew = true;
+	}
+	std::remove(filepath.c_str());
+	TEST_ASSERT(loadThrew, "Loading a NaN profile file must throw");
+	std::vector<float> profile = processor.getBackgroundFrameProfile();
+	TEST_ASSERT(!profile.empty() && profile[0] == 42.0f,
+		"A rejected profile file must leave the previous profile untouched");
+}
+
 // A dimension change must invalidate the frame immediately (before the lazy reinit runs)
 // and after it - including changes that keep the element count identical (equal
 // samplesPerBscan, incompatible layout)
@@ -437,6 +553,7 @@ void runBackendSuite(ope::Backend backend, const char* name) {
 	testEmaBufferSemantics(backend);
 	testSaveLoadReset(backend);
 	testDimensionChangeInvalidatesFrame(backend);
+	testSetConfigProfileHandling(backend);
 }
 
 int main() {
@@ -453,6 +570,7 @@ int main() {
 		}
 
 		std::cout << "\n=== Cross-backend ===" << std::endl;
+		testValidationRejection();
 		testBackendSwitchTransfer();
 		testUnsupportedBackendRejection();
 		testCudaSequenceMatchesCpu();
