@@ -160,6 +160,35 @@ bool browseForCustomFile(AppState* state) {
 	state->filePathBuffer[sizeof(state->filePathBuffer) - 1] = '\0';
 	return true;
 }
+
+bool browseForSaveFile(char* path, size_t pathSize, const char* defaultName, const char* title) {
+	strncpy(path, defaultName, pathSize - 1);
+	path[pathSize - 1] = '\0';
+
+	OPENFILENAMEA dialog = {};
+	dialog.lStructSize = sizeof(dialog);
+	dialog.lpstrFile = path;
+	dialog.nMaxFile = static_cast<DWORD>(pathSize);
+	dialog.lpstrFilter = "Raw Files\0*.raw\0All Files\0*.*\0\0";
+	dialog.lpstrTitle = title;
+	dialog.Flags = OFN_OVERWRITEPROMPT | OFN_HIDEREADONLY;
+
+	return GetSaveFileNameA(&dialog) != 0;
+}
+
+bool browseForOpenFile(char* path, size_t pathSize, const char* title) {
+	path[0] = '\0';
+
+	OPENFILENAMEA dialog = {};
+	dialog.lStructSize = sizeof(dialog);
+	dialog.lpstrFile = path;
+	dialog.nMaxFile = static_cast<DWORD>(pathSize);
+	dialog.lpstrFilter = "Raw Files\0*.raw\0All Files\0*.*\0\0";
+	dialog.lpstrTitle = title;
+	dialog.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_HIDEREADONLY;
+
+	return GetOpenFileNameA(&dialog) != 0;
+}
 #endif
 
 void onProcessedData(const ope::IOBuffer& output, AppState* state) {
@@ -263,8 +292,10 @@ void initializeProcessor(AppState* state) {
 	// Save profiles before recreating processor (if they can be reused)
 	std::vector<float> savedBgProfile;
 	std::vector<float> savedFpnProfile;
+	std::vector<float> savedFrameProfile;
 	bool canReuseBgProfile = false;
 	bool canReuseFpnProfile = false;
+	bool canReuseFrameProfile = false;
 	int oldSignalLength = 0;
 
 	if (state->processor && state->processorInitialized) {
@@ -291,6 +322,11 @@ void initializeProcessor(AppState* state) {
 			// FPN profile should be valid if signal length hasn't changed
 			canReuseFpnProfile = (fpnSize == state->dataParams.samplesPerAscan);
 		}
+
+		// Save background frame if it exists (still valid when e.g. only bscansPerBuffer changed)
+		savedFrameProfile = state->processor->getBackgroundFrameProfile();
+		canReuseFrameProfile = (savedFrameProfile.size() ==
+			static_cast<size_t>(state->dataParams.samplesPerAscan) * state->dataParams.ascansPerBscan);
 	}
 
 	// Recreate processor (either first init or params changed)
@@ -326,6 +362,12 @@ void initializeProcessor(AppState* state) {
 	if (canReuseFpnProfile && !savedFpnProfile.empty()) {
 		std::cout << "Restoring fixed pattern noise profile..." << std::endl;
 		state->processor->setFixedPatternNoiseProfile(savedFpnProfile.data(), savedFpnProfile.size() / 2);
+	}
+
+	if (canReuseFrameProfile && !savedFrameProfile.empty()) {
+		std::cout << "Restoring background frame..." << std::endl;
+		state->processor->setBackgroundFrameProfile(savedFrameProfile.data(),
+			state->dataParams.samplesPerAscan, state->dataParams.ascansPerBscan);
 	}
 
 	std::cout << "Processor initialized ("
@@ -708,6 +750,9 @@ void renderProcessingUI(AppState* state) {
 		}
 		if (ImGui::Button("Record Background Frame", ImVec2(-1, 0))) {
 			if (state->processorInitialized && state->hasDataLoaded) {
+				// Apply the current averaging setting first: the recording target is
+				// latched at request time (Auto Update may not have pushed it yet)
+				state->processor->setBackgroundFrameBscansToAverage(pp.backgroundFrameBscansToAverage);
 				state->processor->requestBackgroundFrameRecording();
 				// Recording averages bscansToAverage B-scans; feed the cached buffer until
 				// the recording completes (recording from the displayed data mostly nulls
@@ -725,6 +770,34 @@ void renderProcessingUI(AppState* state) {
 				if (state->autoUpdate) reprocessData(state);
 			}
 		}
+#ifdef _WIN32
+		if (ImGui::Button("Save Background Frame...", ImVec2(-1, 0))) {
+			if (state->processorInitialized && state->processor->hasBackgroundFrameProfile()) {
+				char path[512];
+				if (browseForSaveFile(path, sizeof(path), "background_frame.raw", "Save background frame")) {
+					try {
+						state->processor->saveBackgroundFrameProfileToFile(path);
+						std::cout << "Background frame saved to " << path << std::endl;
+					} catch (const std::exception& e) {
+						std::cerr << "Failed to save background frame: " << e.what() << std::endl;
+					}
+				}
+			}
+		}
+		if (ImGui::Button("Load Background Frame...", ImVec2(-1, 0))) {
+			if (state->processorInitialized) {
+				char path[512];
+				if (browseForOpenFile(path, sizeof(path), "Load background frame")) {
+					try {
+						state->processor->loadBackgroundFrameProfileFromFile(path);
+						if (state->autoUpdate) reprocessData(state);
+					} catch (const std::exception& e) {
+						std::cerr << "Failed to load background frame: " << e.what() << std::endl;
+					}
+				}
+			}
+		}
+#endif
 		if (state->processorInitialized && state->processor->hasBackgroundFrameProfile()) {
 			ImGui::Text("Background frame: available");
 		} else {
