@@ -50,6 +50,15 @@ public:
 	virtual void setFixedPatternNoiseProfile(const float* profileInterleaved, size_t complexPairs) = 0;
 	virtual const std::vector<float>& getFixedPatternNoiseProfile() const = 0;
 
+	// Background frame (B-scan) management for line-field OCT (frame is samplesPerLine x ascansPerBscan floats)
+	// getBackgroundFrameProfile() returns an owned snapshot (by value) because continuous EMA update
+	// mutates the live frame during processing; a reference into backend state would not be stable
+	virtual void requestBackgroundFrameRecording() = 0;
+	virtual void setBackgroundFrameProfile(const float* frame, size_t samplesPerLine, size_t ascansPerBscan) = 0;
+	virtual std::vector<float> getBackgroundFrameProfile() const = 0;
+	virtual bool hasBackgroundFrameProfile() const = 0;  // cheap status check, no device readback
+	virtual void resetBackgroundFrame() = 0;
+
 };
 
 } // namespace ope

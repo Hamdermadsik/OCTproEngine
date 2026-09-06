@@ -229,6 +229,28 @@ public:
 	void loadPostProcessBackgroundProfileFromFile(const std::string& filepath);
 	void enablePostProcessBackgroundSubtraction(bool enable); 
 	
+	// Background frame (B-scan) subtraction for line-field OCT
+	// Only supported on the CPU and CUDA backends; enabling on other backends throws
+	void enableBackgroundFrameSubtraction(bool enable);
+	void enableBackgroundFrameNormalization(bool enable);
+	void setBackgroundFrameBscansToAverage(int bscansToAverage);
+	void enableContinuousBackgroundFrameUpdate(bool enable);
+	void setBackgroundFrameSmoothing(bool enable, int windowRadius);
+	void requestBackgroundFrameRecording();
+	// Cancels an in-progress recording, clears validity and restarts continuous update from zero
+	void resetBackgroundFrame();
+	// Frame is samplesPerLine x ascansPerBscan floats and must match the current input parameters
+	void setBackgroundFrameProfile(const float* data, size_t samplesPerLine, size_t ascansPerBscan);
+	// Returns an owned snapshot; during continuous update this reads back the current frame from the backend
+	std::vector<float> getBackgroundFrameProfile() const;
+	bool hasBackgroundFrameProfile() const;
+	void saveBackgroundFrameProfileToFile(const std::string& filepath) const;
+	void loadBackgroundFrameProfileFromFile(const std::string& filepath);
+
+	// Post-FFT frame correction for line-field OCT
+	// Only supported on the CPU and CUDA backends; enabling on other backends throws
+	void enablePostFftFrameCorrection(bool enable);
+
 	// Other toggles
 	void enableBscanFlip(bool enable);
 	void enableSinusoidalScanCorrection(bool enable);

@@ -3242,6 +3242,27 @@ const std::vector<float>& VulkanBackend::getFixedPatternNoiseProfile() const {
 	return this->impl->recordedFixedPatternNoise;
 }
 
+void VulkanBackend::requestBackgroundFrameRecording() {
+	throw std::runtime_error("Background frame recording is not yet supported on the Vulkan backend");
+}
+
+void VulkanBackend::setBackgroundFrameProfile(const float* frame, size_t samplesPerLine, size_t ascansPerBscan) {
+	// Stored host-side only so configuration save/load and backend switching preserve the profile
+	this->backgroundFrameProfile.assign(frame, frame + samplesPerLine * ascansPerBscan);
+}
+
+std::vector<float> VulkanBackend::getBackgroundFrameProfile() const {
+	return this->backgroundFrameProfile;
+}
+
+bool VulkanBackend::hasBackgroundFrameProfile() const {
+	return !this->backgroundFrameProfile.empty();
+}
+
+void VulkanBackend::resetBackgroundFrame() {
+	this->backgroundFrameProfile.clear();
+}
+
 
 // ============================================
 // Helper Methods

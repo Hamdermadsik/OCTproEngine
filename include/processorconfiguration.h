@@ -117,6 +117,22 @@ public:
 			bool useCustomProfile = false;
 		} background;
 
+		// Background frame (B-scan) subtraction before FFT (line-field OCT)
+		struct OPE_API BackgroundFrame {
+			bool enabled = false;
+			bool normalize = false;              // subtract only vs. subtract + divide by sqrt(background)
+			int bscansToAverage = 10;            // recording average count; EMA alpha = 1/bscansToAverage
+			bool continuousUpdate = false;       // EMA update from live data instead of static recorded frame
+			bool smoothSpectra = false;          // rolling-average smoothing of background spectra before use
+			int smoothingWindowRadius = 16;      // total window = 2*radius+1
+			bool useCustomProfile = false;
+		} backgroundFrame;
+
+		// Post-FFT frame correction: divide each A-scan by sqrt of its pre-subtraction spectral average (line-field OCT)
+		struct OPE_API FrameCorrection {
+			bool enabled = false;
+		} frameCorrection;
+
 		// Intensity mapping
 		struct OPE_API Intensity {
 			bool logScale = true;
@@ -150,6 +166,14 @@ public:
 	void setBackgroundProfile(const std::vector<float>& data);
 	void setFixedPatternNoiseProfile(const std::vector<float>& complexPairs);
 
+	// Background frame profile (signalLength x ascansPerBscan floats, row = one spectrum).
+	// Both dimensions are stored because equal element counts do not imply equal layout.
+	// The profile is cleared (not resampled) when dimensions no longer match dataParams.
+	void setBackgroundFrameProfile(const std::vector<float>& data, int samplesPerLine, int ascansPerBscan);
+	std::vector<float> getBackgroundFrameProfile() const;
+	int getBackgroundFrameSamplesPerLine() const;
+	int getBackgroundFrameAscansPerBscan() const;
+
 	// Get custom curves (returns adjusted data, empty if not set)
 	std::vector<float> getResamplingLut() const;
 	std::vector<float> getWindowFunction() const;
@@ -168,6 +192,7 @@ public:
 	void clearDispersionPhase();
 	void clearBackgroundProfile();
 	void clearFixedPatternNoiseProfile();
+	void clearBackgroundFrameProfile();
 
 	// === FILE I/O ===
 	enum class LoadMode {
@@ -195,6 +220,8 @@ public:
 	bool loadBackgroundProfileFromFile(const std::string& filepath);
 	bool saveFixedPatternNoiseProfileToFile(const std::string& filepath) const;
 	bool loadFixedPatternNoiseProfileFromFile(const std::string& filepath);
+	bool saveBackgroundFrameProfileToFile(const std::string& filepath) const;
+	bool loadBackgroundFrameProfileFromFile(const std::string& filepath);
 
 	// Validation
 	bool validate() const;
@@ -206,6 +233,7 @@ public:
 	bool hasCustomDispersionCurve() const;
 	bool hasCustomPostProcessBackgroundProfile() const;
 	bool hasCustomFixedPatternNoiseProfile() const;
+	bool hasCustomBackgroundFrameProfile() const;
 
 	void adjustAllCustomCurves();
 

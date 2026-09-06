@@ -110,6 +110,20 @@ struct CudaBackend::Impl {
 	bool postProcessBackgroundRecordingRequested = false;
 	bool postProcessBackgroundUpdated = false;
 	std::vector<float> recordedPostProcessBackground;
+
+	// Background frame (line-field OCT). The three frames are shared across streams;
+	// writes are ordered via the backgroundStageDone event chain in process() and via
+	// drainProcessingStreams() at transitions (mode changes, profile upload, reset)
+	float* d_backgroundFrame = nullptr;          // samplesPerBscan floats
+	float* d_backgroundSmoothedFrame = nullptr;  // cached smoothed copy of d_backgroundFrame
+	float* d_backgroundAccumulator = nullptr;    // recording accumulator
+	std::vector<float*> d_liveSpectralAverages;  // per-stream scratch, one value per A-scan
+	std::vector<float> recordedBackgroundFrame;  // host mirror, refreshed on finalize/setProfile
+	bool backgroundFrameValid = false;
+	bool backgroundRecordingInProgress = false;
+	int backgroundBscansRecorded = 0;
+	bool smoothedFrameDirty = true;
+	cudaEvent_t backgroundStageDone = nullptr;
 	
 	// cuFFT plans (one per stream - internal work buffers not safe for concurrent use)
 	std::vector<cufftHandle> fftPlans;
@@ -354,6 +368,13 @@ void CudaBackend::initialize(const ProcessorConfiguration& config) {
 	// Reset fixed pattern noise state
 	this->impl->fixedPatternNoiseDetermined = false;
 
+	// Reset background frame state
+	this->impl->backgroundFrameValid = false;
+	this->impl->backgroundRecordingInProgress = false;
+	this->impl->backgroundBscansRecorded = 0;
+	this->impl->smoothedFrameDirty = true;
+	this->impl->recordedBackgroundFrame.clear();
+
 	//load recorded profiles from configuration
 	if (config.hasCustomPostProcessBackgroundProfile()) {
 		const std::vector<float>& profileVec = config.getBackgroundProfile();
@@ -394,6 +415,19 @@ void CudaBackend::initialize(const ProcessorConfiguration& config) {
 			this->impl->streams[0]));
 		checkCudaErrors(cudaStreamSynchronize(this->impl->streams[0]));
 		this->impl->fixedPatternNoiseDetermined = true;
+	}
+	if (config.hasCustomBackgroundFrameProfile()) {
+		std::vector<float> frameVec = config.getBackgroundFrameProfile();
+		this->impl->recordedBackgroundFrame = frameVec;
+		checkCudaErrors(cudaMemcpyAsync(
+			this->impl->d_backgroundFrame,
+			frameVec.data(),
+			frameVec.size() * sizeof(float),
+			cudaMemcpyHostToDevice,
+			this->impl->streams[0]));
+		checkCudaErrors(cudaStreamSynchronize(this->impl->streams[0]));
+		this->impl->backgroundFrameValid = true;
+		this->rebuildSmoothedBackgroundFrame();
 	}
 
 	// Start callback worker thread for ordered delivery
@@ -782,6 +816,122 @@ void CudaBackend::process(IOBuffer& input) {
 	}
 #endif
 
+	// Step 1.5: Line-field OCT preprocessing (spectral averages, background frame recording/EMA/subtraction)
+	const ProcessorConfiguration::ProcessingParameters::BackgroundFrame& bfParams =
+		config.processingParams.backgroundFrame;
+	bool frameCorrection = config.processingParams.frameCorrection.enabled;
+	const int samplesPerBscan = signalLength * ascansPerBscan;
+	const int ascansPerBuffer = ascansPerBscan * bscansPerBuffer;
+	float* d_liveSpectralAveragesBuf = this->impl->d_liveSpectralAverages[streamIdx];
+	float frameNormalizationScale = sqrtf(powf(2.0f, static_cast<float>(config.dataParams.getBitDepth())));
+
+	if (frameCorrection) {
+		//live per-A-scan spectral averages for post-FFT frame correction (must be computed before background subtraction removes the DC content)
+		int avgBlockSize = 256;
+		int avgGridSize = (ascansPerBuffer * 32 + avgBlockSize - 1) / avgBlockSize; //one warp (32 threads) per A-scan
+		cuda_kernels::averageLiveSpectra<<<avgGridSize, avgBlockSize, 0, stream>>>(
+			d_liveSpectralAveragesBuf, d_fftBuffer, signalLength, ascansPerBuffer);
+	}
+
+	// Continuous EMA only runs together with subtraction (matches OCTproZ)
+	bool backgroundContinuous = bfParams.continuousUpdate && bfParams.enabled;
+	bool backgroundWritersActive = backgroundContinuous || this->impl->backgroundRecordingInProgress;
+	bool backgroundStageActive = backgroundWritersActive ||
+		(bfParams.enabled && this->impl->backgroundFrameValid);
+
+	// Serialize the background stage across streams: wait on the last writer's event
+	// (a no-op if the event is long completed or was never recorded, so the static
+	// steady state pays effectively nothing), record a new event only when writing
+	if (backgroundStageActive) {
+		checkCudaErrors(cudaStreamWaitEvent(stream, this->impl->backgroundStageDone, 0));
+	}
+
+	// Background frame recording (accumulates across buffers; a recording that completes
+	// here applies starting with the current buffer)
+	if (this->impl->backgroundRecordingInProgress) {
+		int bscansRemaining = bfParams.bscansToAverage - this->impl->backgroundBscansRecorded;
+		int bscansToProcess = std::min(bscansPerBuffer, bscansRemaining);
+		int bgBlockSize = 256;
+		int bgGridSize = (samplesPerBscan + bgBlockSize - 1) / bgBlockSize;
+		cuda_kernels::accumulateBackgroundFrame<<<bgGridSize, bgBlockSize, 0, stream>>>(
+			this->impl->d_backgroundAccumulator, d_fftBuffer, samplesPerBscan, bscansToProcess);
+		this->impl->backgroundBscansRecorded += bscansToProcess;
+
+		if (this->impl->backgroundBscansRecorded >= bfParams.bscansToAverage) {
+			float normFactor = 1.0f / static_cast<float>(this->impl->backgroundBscansRecorded);
+			cuda_kernels::finalizeBackgroundFrame<<<bgGridSize, bgBlockSize, 0, stream>>>(
+				this->impl->d_backgroundFrame, this->impl->d_backgroundAccumulator,
+				normFactor, samplesPerBscan);
+
+			//copy recorded frame to host and sync to configuration
+			this->impl->recordedBackgroundFrame.resize(samplesPerBscan);
+			checkCudaErrors(cudaMemcpyAsync(
+				this->impl->recordedBackgroundFrame.data(),
+				this->impl->d_backgroundFrame,
+				samplesPerBscan * sizeof(float),
+				cudaMemcpyDeviceToHost,
+				stream));
+			checkCudaErrors(cudaStreamSynchronize(stream));
+
+			this->impl->config.setBackgroundFrameProfile(
+				this->impl->recordedBackgroundFrame, signalLength, ascansPerBscan);
+
+			this->impl->backgroundRecordingInProgress = false;
+			this->impl->backgroundFrameValid = true;
+			this->impl->smoothedFrameDirty = true;
+		}
+	}
+
+	// Continuous EMA update: folds ALL B-scans of this buffer into the background first,
+	// the FINAL background is then subtracted from the entire buffer
+	if (backgroundContinuous) {
+		if (!this->impl->backgroundFrameValid) {
+			// EMA bootstraps from a zeroed background and converges over ~bscansToAverage B-scans
+			checkCudaErrors(cudaMemsetAsync(this->impl->d_backgroundFrame, 0,
+				sizeof(float) * samplesPerBscan, stream));
+			this->impl->backgroundFrameValid = true;
+		}
+		float alpha = 1.0f / static_cast<float>(bfParams.bscansToAverage);
+		int bgBlockSize = 256;
+		int bgGridSize = (samplesPerBscan + bgBlockSize - 1) / bgBlockSize;
+		cuda_kernels::updateBackgroundFrameEMA<<<bgGridSize, bgBlockSize, 0, stream>>>(
+			this->impl->d_backgroundFrame, d_fftBuffer, alpha, samplesPerBscan, bscansPerBuffer);
+		this->impl->smoothedFrameDirty = true;
+	}
+
+	// Background frame subtraction (in place on d_fftBuffer)
+	if (bfParams.enabled && this->impl->backgroundFrameValid) {
+		float* d_activeFrame = this->impl->d_backgroundFrame;
+		if (bfParams.smoothSpectra) {
+			if (backgroundWritersActive) {
+				// Writer regime: rebuild in-stream inside the serialized stage
+				int smoothBlockSize = 256;
+				int smoothGridSize = (samplesPerBscan + smoothBlockSize - 1) / smoothBlockSize;
+				cuda_kernels::smoothBackgroundSpectra<<<smoothGridSize, smoothBlockSize, 0, stream>>>(
+					this->impl->d_backgroundSmoothedFrame, this->impl->d_backgroundFrame,
+					bfParams.smoothingWindowRadius, signalLength, samplesPerBscan);
+				this->impl->smoothedFrameDirty = false;
+				d_activeFrame = this->impl->d_backgroundSmoothedFrame;
+			} else if (!this->impl->smoothedFrameDirty) {
+				// Static regime: the cached copy was rebuilt at the last transition
+				d_activeFrame = this->impl->d_backgroundSmoothedFrame;
+			}
+			// else: stale cache in static regime (should not happen, transitions rebuild it);
+			// fall back to the unsmoothed frame rather than reading a stale buffer
+		}
+		if (bfParams.normalize) {
+			cuda_kernels::backgroundFrameSubtractionAndNormalization<<<gridSize, blockSize, 0, stream>>>(
+				d_fftBuffer, d_activeFrame, samplesPerBscan, samplesPerBuffer, frameNormalizationScale);
+		} else {
+			cuda_kernels::backgroundFrameSubtractionOnly<<<gridSize, blockSize, 0, stream>>>(
+				d_fftBuffer, d_activeFrame, samplesPerBscan, samplesPerBuffer);
+		}
+	}
+
+	if (backgroundWritersActive) {
+		checkCudaErrors(cudaEventRecord(this->impl->backgroundStageDone, stream));
+	}
+
 	// Step 2: Rolling average background removal
 	if (config.processingParams.dcRemoval.enabled) {
 		int sharedMemSize = (blockSize + 2 * config.processingParams.dcRemoval.windowSize) * sizeof(float);
@@ -890,7 +1040,15 @@ void CudaBackend::process(IOBuffer& input) {
 
 	// Step 4: IFFT (use per-stream plan)
 	checkCufftErrors(cufftExecC2C(fftPlan, d_fftBuffer2, d_fftBuffer2, CUFFT_INVERSE));
-	
+
+	// Step 4.5: Post-FFT frame correction: divide each A-scan by the square root of its
+	// pre-subtraction spectral average (computed in step 1.5 into per-stream scratch)
+	if (frameCorrection) {
+		cuda_kernels::normalizeAscansBySqrtSpectralAverages<<<gridSize, blockSize, 0, stream>>>(
+			d_fftBuffer2, d_liveSpectralAveragesBuf, frameNormalizationScale,
+			signalLength, samplesPerBuffer);
+	}
+
 	// Step 5: Fixed-pattern noise removal
 	if (config.processingParams.fixedPatternNoise.enabled) {
 		int width = signalLength;
@@ -1053,8 +1211,32 @@ void CudaBackend::process(IOBuffer& input) {
 // ============================================
 
 void CudaBackend::updateConfig(const ProcessorConfiguration& config) {
+	// Background frame transitions (enable/continuous/smoothing changes) modify shared
+	// device state; drain the processing streams once so no in-flight buffer observes
+	// a partially applied regime, then rebuild the smoothed frame under the new settings
+	const ProcessorConfiguration::ProcessingParameters::BackgroundFrame& oldBf =
+		this->impl->config.processingParams.backgroundFrame;
+	const ProcessorConfiguration::ProcessingParameters::BackgroundFrame& newBf =
+		config.processingParams.backgroundFrame;
+	bool backgroundTransition = this->impl->cudaInitialized &&
+		(oldBf.enabled != newBf.enabled ||
+		 oldBf.continuousUpdate != newBf.continuousUpdate ||
+		 oldBf.smoothSpectra != newBf.smoothSpectra ||
+		 oldBf.smoothingWindowRadius != newBf.smoothingWindowRadius);
+
+	if (backgroundTransition) {
+		checkCudaErrors(cudaSetDevice(this->impl->deviceId));
+		this->drainProcessingStreams();
+		if (oldBf.smoothingWindowRadius != newBf.smoothingWindowRadius) {
+			this->impl->smoothedFrameDirty = true;
+		}
+	}
+
 	this->impl->config = config;
-	
+
+	if (backgroundTransition) {
+		this->rebuildSmoothedBackgroundFrame();
+	}
 }
 
 void CudaBackend::updateResamplingCurve(const float* curve, size_t length) {
@@ -1203,7 +1385,145 @@ void CudaBackend::setPostProcessBackgroundProfile(const float* background, size_
 
 const std::vector<float>& CudaBackend::getPostProcessBackgroundProfile() const {
 	return this->impl->recordedPostProcessBackground;
-}	
+}
+
+// ============================================
+// Background Frame Methods (Line-Field OCT)
+// ============================================
+
+void CudaBackend::drainProcessingStreams() {
+	for (cudaStream_t stream : this->impl->streams) {
+		checkCudaErrors(cudaStreamSynchronize(stream));
+	}
+}
+
+void CudaBackend::rebuildSmoothedBackgroundFrame() {
+	// Must only be called with no processing in flight (after initialize() or a drain).
+	// In continuous mode the smoothed frame is instead rebuilt in-stream inside the
+	// event-serialized background stage of process()
+	if (!this->impl->config.processingParams.backgroundFrame.smoothSpectra ||
+		!this->impl->backgroundFrameValid ||
+		!this->impl->smoothedFrameDirty) {
+		return;
+	}
+
+	int samplesPerBscan = this->impl->signalLength * this->impl->ascansPerBscan;
+	int smoothBlockSize = 256;
+	int smoothGridSize = (samplesPerBscan + smoothBlockSize - 1) / smoothBlockSize;
+	cuda_kernels::smoothBackgroundSpectra<<<smoothGridSize, smoothBlockSize, 0, this->impl->userRequestStream>>>(
+		this->impl->d_backgroundSmoothedFrame,
+		this->impl->d_backgroundFrame,
+		this->impl->config.processingParams.backgroundFrame.smoothingWindowRadius,
+		this->impl->signalLength,
+		samplesPerBscan);
+	checkCudaErrors(cudaPeekAtLastError());
+	checkCudaErrors(cudaStreamSynchronize(this->impl->userRequestStream));
+	this->impl->smoothedFrameDirty = false;
+}
+
+void CudaBackend::requestBackgroundFrameRecording() {
+	if (!this->impl->cudaInitialized) {
+		throw std::runtime_error("CUDA backend not initialized");
+	}
+
+	// Set CUDA device for this processor instance (required for multi-device support)
+	checkCudaErrors(cudaSetDevice(this->impl->deviceId));
+
+	// Drain so no in-flight buffer contributes to the fresh accumulator
+	this->drainProcessingStreams();
+
+	int samplesPerBscan = this->impl->signalLength * this->impl->ascansPerBscan;
+	checkCudaErrors(cudaMemset(this->impl->d_backgroundAccumulator, 0, sizeof(float) * samplesPerBscan));
+	this->impl->backgroundBscansRecorded = 0;
+	this->impl->backgroundRecordingInProgress = true;
+}
+
+void CudaBackend::setBackgroundFrameProfile(const float* frame, size_t samplesPerLine, size_t ascansPerBscan) {
+	if (!frame || samplesPerLine == 0 || ascansPerBscan == 0) {
+		throw std::invalid_argument("Invalid background frame profile pointer");
+	}
+	if (samplesPerLine != static_cast<size_t>(this->impl->signalLength) ||
+		ascansPerBscan != static_cast<size_t>(this->impl->ascansPerBscan)) {
+		throw std::invalid_argument("Background frame profile dimensions do not match current configuration");
+	}
+
+	// Set CUDA device for this processor instance (required for multi-device support)
+	checkCudaErrors(cudaSetDevice(this->impl->deviceId));
+
+	// Drain so no in-flight buffer reads the frame while it is replaced
+	this->drainProcessingStreams();
+
+	size_t samplesPerBscan = samplesPerLine * ascansPerBscan;
+	checkCudaErrors(cudaMemcpyAsync(
+		this->impl->d_backgroundFrame,
+		frame,
+		samplesPerBscan * sizeof(float),
+		cudaMemcpyHostToDevice,
+		this->impl->userRequestStream));
+	checkCudaErrors(cudaStreamSynchronize(this->impl->userRequestStream));
+
+	// Update host copy
+	this->impl->recordedBackgroundFrame.assign(frame, frame + samplesPerBscan);
+	this->impl->backgroundFrameValid = true;
+	this->impl->smoothedFrameDirty = true;
+	this->rebuildSmoothedBackgroundFrame();
+}
+
+std::vector<float> CudaBackend::getBackgroundFrameProfile() const {
+	if (!this->impl->backgroundFrameValid) {
+		return {};
+	}
+	if (!this->impl->cudaInitialized) {
+		return this->impl->recordedBackgroundFrame;
+	}
+
+	// Snapshot the live device frame: during continuous EMA update the host mirror is
+	// stale, and this readback is only performed on explicit get/save/backend-transfer
+	// requests - never in the per-buffer hot path
+	checkCudaErrors(cudaSetDevice(this->impl->deviceId));
+	const_cast<CudaBackend*>(this)->drainProcessingStreams();
+
+	int samplesPerBscan = this->impl->signalLength * this->impl->ascansPerBscan;
+	std::vector<float> snapshot(samplesPerBscan);
+	checkCudaErrors(cudaMemcpyAsync(
+		snapshot.data(),
+		this->impl->d_backgroundFrame,
+		samplesPerBscan * sizeof(float),
+		cudaMemcpyDeviceToHost,
+		this->impl->userRequestStream));
+	checkCudaErrors(cudaStreamSynchronize(this->impl->userRequestStream));
+	return snapshot;
+}
+
+bool CudaBackend::hasBackgroundFrameProfile() const {
+	return this->impl->backgroundFrameValid;
+}
+
+void CudaBackend::resetBackgroundFrame() {
+	if (!this->impl->cudaInitialized) {
+		this->impl->recordedBackgroundFrame.clear();
+		this->impl->backgroundFrameValid = false;
+		this->impl->backgroundRecordingInProgress = false;
+		this->impl->backgroundBscansRecorded = 0;
+		return;
+	}
+
+	// Set CUDA device for this processor instance (required for multi-device support)
+	checkCudaErrors(cudaSetDevice(this->impl->deviceId));
+
+	// Drain so no in-flight buffer reads the frame while it is cleared
+	this->drainProcessingStreams();
+
+	int samplesPerBscan = this->impl->signalLength * this->impl->ascansPerBscan;
+	checkCudaErrors(cudaMemset(this->impl->d_backgroundFrame, 0, sizeof(float) * samplesPerBscan));
+	checkCudaErrors(cudaMemset(this->impl->d_backgroundAccumulator, 0, sizeof(float) * samplesPerBscan));
+	this->impl->recordedBackgroundFrame.clear();
+	this->impl->backgroundFrameValid = false;
+	this->impl->backgroundRecordingInProgress = false;
+	this->impl->backgroundBscansRecorded = 0;
+	this->impl->smoothedFrameDirty = true;
+}
+
 
 
 // ============================================
@@ -1370,12 +1690,32 @@ void CudaBackend::allocateDeviceBuffers() {
 		sizeof(float) * this->impl->ascansPerBscan));
 	
 	// Allocate fixed pattern noise buffer
-	checkCudaErrors(cudaMalloc(&this->impl->d_meanALine, 
+	checkCudaErrors(cudaMalloc(&this->impl->d_meanALine,
 		sizeof(cufftComplex) * this->impl->signalLength));
-	
+
 	// Allocate post-processing buffers
 	checkCudaErrors(cudaMalloc(&this->impl->d_postProcBackgroundLine,
 		sizeof(float) * this->impl->signalLength / 2));
+
+	// Allocate background frame buffers (line-field OCT). Preallocated unconditionally so
+	// the feature can be enabled at runtime without reinitialization (~12 MiB at 2048x512)
+	int samplesPerBscan = this->impl->signalLength * this->impl->ascansPerBscan;
+	checkCudaErrors(cudaMalloc(&this->impl->d_backgroundFrame,
+		sizeof(float) * samplesPerBscan));
+	checkCudaErrors(cudaMalloc(&this->impl->d_backgroundSmoothedFrame,
+		sizeof(float) * samplesPerBscan));
+	checkCudaErrors(cudaMalloc(&this->impl->d_backgroundAccumulator,
+		sizeof(float) * samplesPerBscan));
+	checkCudaErrors(cudaMemset(this->impl->d_backgroundFrame, 0, sizeof(float) * samplesPerBscan));
+	checkCudaErrors(cudaMemset(this->impl->d_backgroundAccumulator, 0, sizeof(float) * samplesPerBscan));
+
+	// Per-stream spectral average scratch for post-FFT frame correction
+	int ascansPerBuffer = this->impl->ascansPerBscan * this->impl->bscansPerBuffer;
+	this->impl->d_liveSpectralAverages.resize(this->impl->numStreams);
+	for (int i = 0; i < this->impl->numStreams; ++i) {
+		checkCudaErrors(cudaMalloc(&this->impl->d_liveSpectralAverages[i],
+			sizeof(float) * ascansPerBuffer));
+	}
 }
 
 void CudaBackend::releaseDeviceBuffers() {
@@ -1407,9 +1747,17 @@ void CudaBackend::releaseDeviceBuffers() {
 	
 	// Free fixed pattern noise buffer
 	if (this->impl->d_meanALine) { cudaFree(this->impl->d_meanALine); this->impl->d_meanALine = nullptr; }
-	
+
 	// Free post-processing buffers
 	if (this->impl->d_postProcBackgroundLine) { cudaFree(this->impl->d_postProcBackgroundLine); this->impl->d_postProcBackgroundLine = nullptr; }
+
+	// Free background frame buffers
+	if (this->impl->d_backgroundFrame) { cudaFree(this->impl->d_backgroundFrame); this->impl->d_backgroundFrame = nullptr; }
+	if (this->impl->d_backgroundSmoothedFrame) { cudaFree(this->impl->d_backgroundSmoothedFrame); this->impl->d_backgroundSmoothedFrame = nullptr; }
+	if (this->impl->d_backgroundAccumulator) { cudaFree(this->impl->d_backgroundAccumulator); this->impl->d_backgroundAccumulator = nullptr; }
+
+	for (auto buf : this->impl->d_liveSpectralAverages) { if (buf) cudaFree(buf); }
+	this->impl->d_liveSpectralAverages.clear();
 }
 
 void CudaBackend::createStreamsAndEvents() {
@@ -1419,6 +1767,7 @@ void CudaBackend::createStreamsAndEvents() {
 	}
 	checkCudaErrors(cudaStreamCreate(&this->impl->userRequestStream));
 	checkCudaErrors(cudaEventCreate(&this->impl->syncEvent));
+	checkCudaErrors(cudaEventCreateWithFlags(&this->impl->backgroundStageDone, cudaEventDisableTiming));
 }
 
 void CudaBackend::destroyStreamsAndEvents() {
@@ -1435,6 +1784,11 @@ void CudaBackend::destroyStreamsAndEvents() {
 	if (this->impl->syncEvent) {
 		cudaEventDestroy(this->impl->syncEvent);
 		this->impl->syncEvent = nullptr;
+	}
+
+	if (this->impl->backgroundStageDone) {
+		cudaEventDestroy(this->impl->backgroundStageDone);
+		this->impl->backgroundStageDone = nullptr;
 	}
 }
 

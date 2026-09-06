@@ -2,6 +2,7 @@
 #include "cpu_kernels.h"
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <complex>
 #include <condition_variable>
 #include <cstring>
@@ -74,6 +75,25 @@ struct CpuBackend::Impl {
 	bool fixedPatternNoiseDeterminationRequested = false;
 
 	bool postProcessBackgroundRecordingRequested;
+
+	// Background frame (line-field OCT) state. Guarded by processingStateMutex together
+	// with config: the worker thread holds the lock for a whole buffer while public
+	// setters may replace these vectors from another thread
+	mutable std::mutex processingStateMutex;
+	std::vector<float> backgroundFrame;              // samplesPerBscan floats, valid when non-empty
+	std::vector<float> smoothedBackgroundFrame;      // cached smoothed copy of backgroundFrame
+	bool smoothedFrameDirty = true;
+	std::vector<float> backgroundFrameAccumulator;
+	int backgroundFrameBscansRecorded = 0;
+	bool backgroundFrameRecordingInProgress = false;
+
+	// Per-buffer spectral averages for post-FFT frame correction (one value per A-scan)
+	std::vector<float> liveSpectralAverages;
+
+	// Buffer-level preparation for line-field OCT features (must run before the per-A-scan
+	// loop: EMA folds ALL B-scans of the buffer into the background first, then the FINAL
+	// background is subtracted from the entire buffer - matching the CUDA/OCTproZ semantics)
+	void prepareBackgroundFrame(const void* inputData);
 
 	// Temporary buffers for per-A-scan processing
 	std::vector<std::complex<float>> spectrum;
@@ -188,7 +208,12 @@ struct CpuBackend::Impl {
 			// Propagate buffer ID to output
 			output.setBufferId(bufferId);
 
-			this->processData(this->processingBuffer.data(), output);
+			// Hold the state lock for the whole buffer so setters cannot replace
+			// background/config state mid-buffer; released before the callback
+			{
+				std::lock_guard<std::mutex> stateLock(this->processingStateMutex);
+				this->processData(this->processingBuffer.data(), output);
+			}
 
 			// Invoke callback
 			if (this->callback) {
@@ -206,6 +231,21 @@ struct CpuBackend::Impl {
 		const int outputSamplesPerAscan = signalLength / 2;
 
 		float* outputPtr = static_cast<float*>(output.getDataPointer());
+
+		// Line-field OCT: buffer-level preparation (spectral averages, recording, EMA, smoothing).
+		// Must run before the per-A-scan loop so the FINAL background of this buffer is
+		// subtracted from ALL its A-scans (see prepareBackgroundFrame)
+		bool backgroundFrameActive = config.processingParams.backgroundFrame.enabled;
+		bool frameCorrectionActive = config.processingParams.frameCorrection.enabled;
+		if (backgroundFrameActive || frameCorrectionActive || this->backgroundFrameRecordingInProgress) {
+			this->prepareBackgroundFrame(inputData);
+		}
+		const std::vector<float>& activeBackgroundFrame =
+			(config.processingParams.backgroundFrame.smoothSpectra && !this->smoothedBackgroundFrame.empty())
+			? this->smoothedBackgroundFrame
+			: this->backgroundFrame;
+		bool applyBackgroundFrame = backgroundFrameActive && !activeBackgroundFrame.empty();
+		float frameNormalizationScale = std::sqrt(std::pow(2.0f, static_cast<float>(config.dataParams.getBitDepth())));
 
 		// Check if we need FPN processing (requires allIfftOutputs storage)
 		bool needsFPN = this->fixedPatternNoiseDeterminationRequested ||
@@ -231,6 +271,18 @@ struct CpuBackend::Impl {
 				this->spectrum
 			);
 			
+			// 1.5 Background frame subtraction (line-field OCT, before DC removal to match OCTproZ order)
+			if (applyBackgroundFrame) {
+				const float* backgroundRow = activeBackgroundFrame.data() +
+				                             (ascanIdx % ascansPerBscan) * signalLength;
+				cpu_kernels::backgroundFrameSubtraction<float>(
+					this->spectrum,
+					backgroundRow,
+					config.processingParams.backgroundFrame.normalize,
+					frameNormalizationScale
+				);
+			}
+
 			// 2. Background removal (if enabled)
 			if (config.processingParams.dcRemoval.enabled) {
 				cpu_kernels::rollingAverageDCRemoval<float>(
@@ -274,6 +326,15 @@ struct CpuBackend::Impl {
 				this->fftIn,
 				this->fftOut
 			);
+
+			// 6.5 Post-FFT frame correction: divide by sqrt of the pre-subtraction spectral average
+			if (frameCorrectionActive) {
+				cpu_kernels::normalizeBySqrtSpectralAverage<float>(
+					this->ifftOutput,
+					this->liveSpectralAverages[ascanIdx],
+					frameNormalizationScale
+				);
+			}
 
 			if (needsFPN) {
 				// Store IFFT output for later post-processing (fixed-pattern noise removal requires whole-buffer context)
@@ -426,6 +487,105 @@ void CpuBackend::Impl::computeFixedPatternNoiseIfRequested(const ProcessorConfig
 	this->fixedPatternNoiseDeterminationRequested = false;
 }
 
+void CpuBackend::Impl::prepareBackgroundFrame(const void* inputData) {
+	const ProcessorConfiguration& config = this->config;
+	const int signalLength = config.dataParams.signalLength;
+	const int ascansPerBscan = config.dataParams.ascansPerBscan;
+	const int bscansPerBuffer = config.dataParams.bscansPerBuffer;
+	const int totalAscans = ascansPerBscan * bscansPerBuffer;
+	const int samplesPerBscan = signalLength * ascansPerBscan;
+	const int bytesPerSample = config.dataParams.getBitDepth() / 8;
+
+	bool frameCorrection = config.processingParams.frameCorrection.enabled;
+	bool recording = this->backgroundFrameRecordingInProgress;
+	// Continuous EMA only runs together with subtraction (matches OCTproZ); it bootstraps
+	// from a zeroed background and converges over ~bscansToAverage B-scans
+	bool continuous = config.processingParams.backgroundFrame.continuousUpdate &&
+	                  config.processingParams.backgroundFrame.enabled;
+
+	if (frameCorrection || recording || continuous) {
+		if (frameCorrection) {
+			this->liveSpectralAverages.resize(totalAscans);
+		}
+		if (continuous && this->backgroundFrame.empty()) {
+			this->backgroundFrame.assign(samplesPerBscan, 0.0f);
+		}
+
+		int bscansToRecord = 0;
+		if (recording) {
+			int bscansRemaining = config.processingParams.backgroundFrame.bscansToAverage - this->backgroundFrameBscansRecorded;
+			bscansToRecord = std::min(bscansPerBuffer, bscansRemaining);
+		}
+		float alpha = 1.0f / static_cast<float>(config.processingParams.backgroundFrame.bscansToAverage);
+
+		// One conversion pass over the buffer; each consumer reads the raw (pre-subtraction) spectra.
+		// Sequential A-scan order folds the B-scans into the EMA background in buffer order,
+		// matching the CUDA updateBackgroundFrameEMA kernel semantics.
+		for (int ascanIdx = 0; ascanIdx < totalAscans; ++ascanIdx) {
+			const void* ascanStart = static_cast<const uint8_t*>(inputData) +
+			                         (ascanIdx * signalLength * bytesPerSample);
+			cpu_kernels::convertInputData<float>(
+				ascanStart,
+				signalLength,
+				config.dataParams.getBitDepth(),
+				this->spectrum
+			);
+
+			if (frameCorrection) {
+				this->liveSpectralAverages[ascanIdx] = cpu_kernels::spectralAverage<float>(this->spectrum);
+			}
+
+			int bscanIdx = ascanIdx / ascansPerBscan;
+			int rowOffset = (ascanIdx % ascansPerBscan) * signalLength;
+
+			if (recording && bscanIdx < bscansToRecord) {
+				for (int s = 0; s < signalLength; ++s) {
+					this->backgroundFrameAccumulator[rowOffset + s] += this->spectrum[s].real();
+				}
+			}
+			if (continuous) {
+				for (int s = 0; s < signalLength; ++s) {
+					float& bg = this->backgroundFrame[rowOffset + s];
+					bg = alpha * this->spectrum[s].real() + (1.0f - alpha) * bg;
+				}
+			}
+		}
+
+		if (recording) {
+			this->backgroundFrameBscansRecorded += bscansToRecord;
+			if (this->backgroundFrameBscansRecorded >= config.processingParams.backgroundFrame.bscansToAverage) {
+				// Finalize: the recorded frame applies starting with the current buffer
+				float normFactor = 1.0f / static_cast<float>(this->backgroundFrameBscansRecorded);
+				this->backgroundFrame.resize(samplesPerBscan);
+				for (int i = 0; i < samplesPerBscan; ++i) {
+					this->backgroundFrame[i] = this->backgroundFrameAccumulator[i] * normFactor;
+				}
+				this->backgroundFrameRecordingInProgress = false;
+				this->smoothedFrameDirty = true;
+
+				//sync recorded profile to configuration
+				this->config.setBackgroundFrameProfile(this->backgroundFrame, signalLength, ascansPerBscan);
+			}
+		}
+		if (continuous) {
+			this->smoothedFrameDirty = true;
+		}
+	}
+
+	// Rebuild the cached smoothed frame only when the background or the smoothing settings changed
+	if (config.processingParams.backgroundFrame.enabled &&
+		config.processingParams.backgroundFrame.smoothSpectra &&
+		!this->backgroundFrame.empty() && this->smoothedFrameDirty) {
+		cpu_kernels::smoothBackgroundFrame<float>(
+			this->backgroundFrame,
+			this->smoothedBackgroundFrame,
+			config.processingParams.backgroundFrame.smoothingWindowRadius,
+			signalLength
+		);
+		this->smoothedFrameDirty = false;
+	}
+}
+
 
 // ============================================
 // CpuBackend Implementation
@@ -507,6 +667,10 @@ void CpuBackend::initialize(const ProcessorConfiguration& config) {
 	if (config.hasCustomFixedPatternNoiseProfile()) {
 		this->impl->recordedFixedPatternNoise = config.getFixedPatternNoiseProfile();
 	}
+	if (config.hasCustomBackgroundFrameProfile()) {
+		this->impl->backgroundFrame = config.getBackgroundFrameProfile();
+		this->impl->smoothedFrameDirty = true;
+	}
 
 	// Start processing thread
 	this->impl->stopProcessing = false;
@@ -572,6 +736,13 @@ void CpuBackend::cleanup() {
 	std::vector<float>().swap(this->impl->windowCurve);
 	std::vector<float>().swap(this->impl->recordedFixedPatternNoise);
 	std::vector<float>().swap(this->impl->postProcessBackgroundProfile);
+	std::vector<float>().swap(this->impl->backgroundFrame);
+	std::vector<float>().swap(this->impl->smoothedBackgroundFrame);
+	std::vector<float>().swap(this->impl->backgroundFrameAccumulator);
+	std::vector<float>().swap(this->impl->liveSpectralAverages);
+	this->impl->backgroundFrameBscansRecorded = 0;
+	this->impl->backgroundFrameRecordingInProgress = false;
+	this->impl->smoothedFrameDirty = true;
 	std::vector<std::complex<float>>().swap(this->impl->spectrum);
 	std::vector<std::complex<float>>().swap(this->impl->linearizedSpectrum);
 	std::vector<std::complex<float>>().swap(this->impl->ifftOutput);
@@ -595,6 +766,12 @@ void CpuBackend::process(IOBuffer& input) {
 }
 
 void CpuBackend::updateConfig(const ProcessorConfiguration& config) {
+	std::lock_guard<std::mutex> lock(this->impl->processingStateMutex);
+	// A changed smoothing radius must invalidate the cached smoothed background frame
+	if (config.processingParams.backgroundFrame.smoothingWindowRadius !=
+		this->impl->config.processingParams.backgroundFrame.smoothingWindowRadius) {
+		this->impl->smoothedFrameDirty = true;
+	}
 	this->impl->config = config;
 }
 
@@ -712,6 +889,50 @@ void CpuBackend::setFixedPatternNoiseProfile(const float* profileInterleaved, si
 
 const std::vector<float>& CpuBackend::getFixedPatternNoiseProfile() const {
 	return this->impl->recordedFixedPatternNoise;
+}
+
+// Background frame management (line-field OCT)
+void CpuBackend::requestBackgroundFrameRecording() {
+	std::lock_guard<std::mutex> lock(this->impl->processingStateMutex);
+	int samplesPerBscan = this->impl->config.dataParams.signalLength *
+	                      this->impl->config.dataParams.ascansPerBscan;
+	this->impl->backgroundFrameAccumulator.assign(samplesPerBscan, 0.0f);
+	this->impl->backgroundFrameBscansRecorded = 0;
+	this->impl->backgroundFrameRecordingInProgress = true;
+}
+
+void CpuBackend::setBackgroundFrameProfile(const float* frame, size_t samplesPerLine, size_t ascansPerBscan) {
+	if (!frame || samplesPerLine == 0 || ascansPerBscan == 0) {
+		throw std::invalid_argument("Invalid background frame profile pointer");
+	}
+	if (samplesPerLine != static_cast<size_t>(this->impl->config.dataParams.signalLength) ||
+		ascansPerBscan != static_cast<size_t>(this->impl->config.dataParams.ascansPerBscan)) {
+		throw std::invalid_argument("Background frame profile dimensions do not match current configuration");
+	}
+
+	std::lock_guard<std::mutex> lock(this->impl->processingStateMutex);
+	this->impl->backgroundFrame.assign(frame, frame + samplesPerLine * ascansPerBscan);
+	this->impl->smoothedFrameDirty = true;
+}
+
+std::vector<float> CpuBackend::getBackgroundFrameProfile() const {
+	std::lock_guard<std::mutex> lock(this->impl->processingStateMutex);
+	return this->impl->backgroundFrame;
+}
+
+bool CpuBackend::hasBackgroundFrameProfile() const {
+	std::lock_guard<std::mutex> lock(this->impl->processingStateMutex);
+	return !this->impl->backgroundFrame.empty();
+}
+
+void CpuBackend::resetBackgroundFrame() {
+	std::lock_guard<std::mutex> lock(this->impl->processingStateMutex);
+	this->impl->backgroundFrame.clear();
+	this->impl->smoothedBackgroundFrame.clear();
+	this->impl->backgroundFrameAccumulator.clear();
+	this->impl->backgroundFrameBscansRecorded = 0;
+	this->impl->backgroundFrameRecordingInProgress = false;
+	this->impl->smoothedFrameDirty = true;
 }
 
 

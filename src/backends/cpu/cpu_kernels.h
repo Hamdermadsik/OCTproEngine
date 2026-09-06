@@ -101,6 +101,35 @@ void meanALineSubtraction(
 	const std::vector<T>& meanInterleaved
 );
 
+// Background frame subtraction and post-FFT frame correction helpers (line-field OCT)
+template <typename T>
+T spectralAverage(
+	const std::vector<std::complex<T>>& spectrum
+);
+
+template <typename T>
+void backgroundFrameSubtraction(
+	std::vector<std::complex<T>>& spectrum,
+	const T* backgroundRow,
+	bool normalize,
+	T normalizationScale
+);
+
+template <typename T>
+void smoothBackgroundFrame(
+	const std::vector<T>& frame,
+	std::vector<T>& smoothed,
+	int windowRadius,
+	int samplesPerLine
+);
+
+template <typename T>
+void normalizeBySqrtSpectralAverage(
+	std::vector<std::complex<T>>& data,
+	T average,
+	T normalizationScale
+);
+
 template <typename T>
 T cubicHermiteInterpolation(
 	const T y0,

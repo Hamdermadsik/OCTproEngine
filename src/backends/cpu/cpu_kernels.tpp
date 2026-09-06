@@ -480,6 +480,95 @@ void meanALineSubtraction(
 
 
 // ============================================
+// Background frame subtraction and post-FFT frame correction (line-field OCT)
+// ============================================
+
+// Averages an A-scan's raw spectrum to a single value (real part, pre-subtraction)
+template <typename T>
+T spectralAverage(
+	const std::vector<std::complex<T>>& spectrum
+)
+{
+	if (spectrum.empty()) return static_cast<T>(0);
+
+	T sum = static_cast<T>(0);
+	for (const auto& sample : spectrum) {
+		sum += sample.real();
+	}
+	return sum / static_cast<T>(spectrum.size());
+}
+
+// Subtracts the background spectrum of this A-scan's position within the B-scan,
+// optionally normalizing by sqrt(background). Same formula as the CUDA kernels
+// backgroundFrameSubtractionOnly / backgroundFrameSubtractionAndNormalization.
+template <typename T>
+void backgroundFrameSubtraction(
+	std::vector<std::complex<T>>& spectrum,
+	const T* backgroundRow,
+	bool normalize,
+	T normalizationScale
+)
+{
+	size_t size = spectrum.size();
+	for (size_t i = 0; i < size; ++i) {
+		T backgroundValue = backgroundRow[i];
+		T inputValue = spectrum[i].real() - backgroundValue;
+		if (normalize) {
+			backgroundValue = std::sqrt(backgroundValue);
+			if (backgroundValue > static_cast<T>(1)) {
+				inputValue = normalizationScale * (inputValue / backgroundValue);
+			}
+		}
+		spectrum[i].real(inputValue);
+		spectrum[i].imag(static_cast<T>(0));
+	}
+}
+
+// Smooths each background spectrum with a rolling average filter (window = 2*windowRadius+1, clamped at spectrum edges)
+template <typename T>
+void smoothBackgroundFrame(
+	const std::vector<T>& frame,
+	std::vector<T>& smoothed,
+	int windowRadius,
+	int samplesPerLine
+)
+{
+	int samplesPerBscan = static_cast<int>(frame.size());
+	smoothed.resize(samplesPerBscan);
+
+	for (int index = 0; index < samplesPerBscan; ++index) {
+		int sampleIndex = index % samplesPerLine;
+		int firstIndexOfLine = index - sampleIndex;
+		int startIdx = std::max(firstIndexOfLine, index - windowRadius);
+		int endIdx = std::min(firstIndexOfLine + samplesPerLine - 1, index + windowRadius);
+		T sum = static_cast<T>(0);
+		for (int i = startIdx; i <= endIdx; ++i) {
+			sum += frame[i];
+		}
+		smoothed[index] = sum / static_cast<T>(endIdx - startIdx + 1);
+	}
+}
+
+// Post-FFT frame correction: divides an A-scan by the square root of its pre-subtraction
+// spectral average. Same formula as the CUDA kernel normalizeAscansBySqrtSpectralAverages.
+template <typename T>
+void normalizeBySqrtSpectralAverage(
+	std::vector<std::complex<T>>& data,
+	T average,
+	T normalizationScale
+)
+{
+	T rootAverage = std::sqrt(average);
+	if (rootAverage > static_cast<T>(1)) {
+		T factor = normalizationScale / rootAverage;
+		for (auto& sample : data) {
+			sample *= factor;
+		}
+	}
+}
+
+
+// ============================================
 // Helper functions
 // ============================================
 

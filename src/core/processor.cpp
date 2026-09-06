@@ -16,6 +16,7 @@
 #include <stdexcept>
 #include <fstream>
 #include <cstring>
+#include <cmath>
 #include <unordered_map>
 #include "processor.h"
 
@@ -284,6 +285,52 @@ public:
 		this->updateBackendDispersionCurve();
 	}
 
+	// Line-field OCT features (background frame subtraction, post-FFT frame correction)
+	// are currently only implemented in the CPU and CUDA backends
+	static bool backendSupportsLineFieldFeatures(Backend type) {
+		return type == Backend::CPU || type == Backend::CUDA;
+	}
+
+	static void throwIfLineFieldUnsupported(Backend type) {
+		if (!backendSupportsLineFieldFeatures(type)) {
+			throw std::runtime_error(
+				"Background frame subtraction and post-FFT frame correction are not yet "
+				"supported on this backend. Use Backend::CPU or Backend::CUDA."
+			);
+		}
+	}
+
+	static void throwIfUnsupportedLineFieldFeatures(const ProcessorConfiguration& config, Backend type) {
+		if (config.processingParams.backgroundFrame.enabled ||
+			config.processingParams.frameCorrection.enabled) {
+			throwIfLineFieldUnsupported(type);
+		}
+	}
+
+	// Pull profiles recorded by the backend into the processor configuration so they
+	// survive backend switches and are included when saving the configuration
+	void syncBackendProfilesToConfig() {
+		if (!this->initialized) return;
+
+		// Get profiles from backend and update processor's config
+		const std::vector<float>& bgProfile = this->backend->getPostProcessBackgroundProfile();
+		if (!bgProfile.empty()) {
+			this->config.setBackgroundProfile(bgProfile);
+		}
+
+		const std::vector<float>& fpnProfile = this->backend->getFixedPatternNoiseProfile();
+		if (!fpnProfile.empty()) {
+			this->config.setFixedPatternNoiseProfile(fpnProfile);
+		}
+
+		std::vector<float> frameProfile = this->backend->getBackgroundFrameProfile();
+		if (!frameProfile.empty()) {
+			this->config.setBackgroundFrameProfile(frameProfile,
+				this->config.dataParams.signalLength,
+				this->config.dataParams.ascansPerBscan);
+		}
+	}
+
 	void ensureInitialized() {
 		if (!this->initialized) {
 			this->initialize();
@@ -296,6 +343,7 @@ public:
 		if (!this->config.validate()) {
 			throw std::runtime_error("Invalid processor configuration");
 		}
+		throwIfUnsupportedLineFieldFeatures(this->config, this->backendType);
 
 		this->nextBufferId = 0;
 
@@ -336,6 +384,7 @@ public:
 		if (!this->config.validate()) {
 			throw std::runtime_error("Invalid processor configuration");
 		}
+		throwIfUnsupportedLineFieldFeatures(this->config, this->backendType);
 
 		this->backend->cleanup();
 		this->backend->initialize(this->config);
@@ -506,6 +555,8 @@ void Processor::loadConfigurationFromFile(const std::string& filepath) {
 }
 
 void Processor::saveConfigurationToFile(const std::string& filepath) const {
+	// Include profiles recorded by the backend since the last sync
+	this->impl->syncBackendProfilesToConfig();
 	if (!this->impl->config.saveToFile(filepath)) {
 		throw std::runtime_error("Failed to save configuration to: " + filepath);
 	}
@@ -520,6 +571,9 @@ const ProcessorConfiguration& Processor::getConfig() const {
 }
 
 void Processor::setConfig(const ProcessorConfiguration& config) {
+	// Validate before committing: a rejected configuration must leave no partial state
+	Impl::throwIfUnsupportedLineFieldFeatures(config, this->impl->backendType);
+
 	// Check if buffer dimensions changed
 	bool dimensionsChanged =
 		this->impl->config.dataParams.signalLength != config.dataParams.signalLength ||
@@ -594,21 +648,15 @@ void Processor::setBackend(Backend backend) {
 		return;
 	}
 
+	// Validate before committing: the new backend must support all enabled features
+	Impl::throwIfUnsupportedLineFieldFeatures(this->impl->config, backend);
+
 	// Remember if old backend was initialized
 	bool wasInitialized = this->impl->initialized;
 
 	// Sync backend's recorded profiles to processor's config before cleanup
 	if (this->impl->initialized) {
-		// Get profiles from backend and update processor's config
-		const std::vector<float>& bgProfile = this->impl->backend->getPostProcessBackgroundProfile();
-		if (!bgProfile.empty()) {
-			this->impl->config.setBackgroundProfile(bgProfile);
-		}
-
-		const std::vector<float>& fpnProfile = this->impl->backend->getFixedPatternNoiseProfile();
-		if (!fpnProfile.empty()) {
-			this->impl->config.setFixedPatternNoiseProfile(fpnProfile);
-		}
+		this->impl->syncBackendProfilesToConfig();
 
 		// Clean up old backend
 		this->impl->backend->cleanup();
@@ -958,6 +1006,162 @@ void Processor::enableBscanFlip(bool enable) {
 
 void Processor::enableSinusoidalScanCorrection(bool enable) {
 	this->impl->config.processingParams.geometry.sinusoidalCorrection = enable;
+}
+
+// ============================================
+// BACKGROUND FRAME SUBTRACTION (LINE-FIELD OCT)
+// ============================================
+
+void Processor::enableBackgroundFrameSubtraction(bool enable) {
+	// Validate before committing: enabling on an unsupported backend must not change state
+	if (enable) {
+		Impl::throwIfLineFieldUnsupported(this->impl->backendType);
+	}
+	this->impl->config.processingParams.backgroundFrame.enabled = enable;
+	if (this->impl->initialized) {
+		this->impl->backend->updateConfig(this->impl->config);
+	}
+}
+
+void Processor::enableBackgroundFrameNormalization(bool enable) {
+	this->impl->config.processingParams.backgroundFrame.normalize = enable;
+	if (this->impl->initialized) {
+		this->impl->backend->updateConfig(this->impl->config);
+	}
+}
+
+void Processor::setBackgroundFrameBscansToAverage(int bscansToAverage) {
+	if (bscansToAverage < 1) throw std::invalid_argument("bscansToAverage must be >= 1");
+	this->impl->config.processingParams.backgroundFrame.bscansToAverage = bscansToAverage;
+	if (this->impl->initialized) {
+		this->impl->backend->updateConfig(this->impl->config);
+	}
+}
+
+void Processor::enableContinuousBackgroundFrameUpdate(bool enable) {
+	this->impl->config.processingParams.backgroundFrame.continuousUpdate = enable;
+	if (this->impl->initialized) {
+		this->impl->backend->updateConfig(this->impl->config);
+	}
+}
+
+void Processor::setBackgroundFrameSmoothing(bool enable, int windowRadius) {
+	if (windowRadius < 0) throw std::invalid_argument("windowRadius must be >= 0");
+	this->impl->config.processingParams.backgroundFrame.smoothSpectra = enable;
+	this->impl->config.processingParams.backgroundFrame.smoothingWindowRadius = windowRadius;
+	if (this->impl->initialized) {
+		this->impl->backend->updateConfig(this->impl->config);
+	}
+}
+
+void Processor::requestBackgroundFrameRecording() {
+	Impl::throwIfLineFieldUnsupported(this->impl->backendType);
+	this->impl->backend->requestBackgroundFrameRecording();
+}
+
+void Processor::resetBackgroundFrame() {
+	Impl::throwIfLineFieldUnsupported(this->impl->backendType);
+	this->impl->backend->resetBackgroundFrame();
+	// Also clear the configuration copy so getters do not fall back to the old profile
+	this->impl->config.clearBackgroundFrameProfile();
+}
+
+void Processor::setBackgroundFrameProfile(const float* data, size_t samplesPerLine, size_t ascansPerBscan) {
+	if (!data || samplesPerLine == 0 || ascansPerBscan == 0) {
+		throw std::invalid_argument("Invalid background frame profile data");
+	}
+	if (samplesPerLine != static_cast<size_t>(this->impl->config.dataParams.signalLength) ||
+		ascansPerBscan != static_cast<size_t>(this->impl->config.dataParams.ascansPerBscan)) {
+		throw std::invalid_argument(
+			"Background frame profile dimensions must match current input parameters. Expected " +
+			std::to_string(this->impl->config.dataParams.signalLength) + " x " +
+			std::to_string(this->impl->config.dataParams.ascansPerBscan) + " but got " +
+			std::to_string(samplesPerLine) + " x " + std::to_string(ascansPerBscan)
+		);
+	}
+
+	// Reject invalid values instead of clamping: clamping would silently alter calibration data,
+	// and negative values would produce NaN in the sqrt-based normalization
+	size_t sampleCount = samplesPerLine * ascansPerBscan;
+	for (size_t i = 0; i < sampleCount; ++i) {
+		if (!std::isfinite(data[i]) || data[i] < 0.0f) {
+			throw std::invalid_argument(
+				"Background frame profile contains a negative or non-finite value at index " + std::to_string(i)
+			);
+		}
+	}
+
+	// Store in configuration (for metadata persistence)
+	this->impl->config.setBackgroundFrameProfile(
+		std::vector<float>(data, data + sampleCount),
+		static_cast<int>(samplesPerLine),
+		static_cast<int>(ascansPerBscan));
+
+	// Update backend if initialized
+	if (this->impl->initialized) {
+		this->impl->backend->setBackgroundFrameProfile(data, samplesPerLine, ascansPerBscan);
+	}
+}
+
+std::vector<float> Processor::getBackgroundFrameProfile() const {
+	// Backend has the most recent frame (it may have been recorded or EMA-updated)
+	if (this->impl->initialized) {
+		std::vector<float> profile = this->impl->backend->getBackgroundFrameProfile();
+		if (!profile.empty()) {
+			return profile;
+		}
+	}
+	// Fall back to config
+	return this->impl->config.getBackgroundFrameProfile();
+}
+
+bool Processor::hasBackgroundFrameProfile() const {
+	if (this->impl->initialized && this->impl->backend->hasBackgroundFrameProfile()) {
+		return true;
+	}
+	return this->impl->config.hasCustomBackgroundFrameProfile();
+}
+
+void Processor::saveBackgroundFrameProfileToFile(const std::string& filepath) const {
+	// Snapshot the current frame from the backend first (it may have been recorded or EMA-updated)
+	this->impl->syncBackendProfilesToConfig();
+	if (!this->impl->config.hasCustomBackgroundFrameProfile()) {
+		throw std::runtime_error("No background frame profile to save");
+	}
+	if (!this->impl->config.saveBackgroundFrameProfileToFile(filepath)) {
+		throw std::runtime_error("Failed to save background frame profile to: " + filepath);
+	}
+}
+
+void Processor::loadBackgroundFrameProfileFromFile(const std::string& filepath) {
+	if (!this->impl->config.loadBackgroundFrameProfileFromFile(filepath)) {
+		throw std::runtime_error("Failed to load background frame profile from: " + filepath);
+	}
+	// The config setter clears the profile if its dimensions do not match dataParams
+	if (!this->impl->config.hasCustomBackgroundFrameProfile()) {
+		throw std::runtime_error("Background frame profile dimensions do not match current input parameters");
+	}
+	if (this->impl->initialized) {
+		std::vector<float> profile = this->impl->config.getBackgroundFrameProfile();
+		this->impl->backend->setBackgroundFrameProfile(profile.data(),
+			static_cast<size_t>(this->impl->config.dataParams.signalLength),
+			static_cast<size_t>(this->impl->config.dataParams.ascansPerBscan));
+	}
+}
+
+// ============================================
+// POST-FFT FRAME CORRECTION (LINE-FIELD OCT)
+// ============================================
+
+void Processor::enablePostFftFrameCorrection(bool enable) {
+	// Validate before committing: enabling on an unsupported backend must not change state
+	if (enable) {
+		Impl::throwIfLineFieldUnsupported(this->impl->backendType);
+	}
+	this->impl->config.processingParams.frameCorrection.enabled = enable;
+	if (this->impl->initialized) {
+		this->impl->backend->updateConfig(this->impl->config);
+	}
 }
 
 void Processor::enableFixedPatternNoiseRemoval(bool enable) {

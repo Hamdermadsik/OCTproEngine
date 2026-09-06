@@ -645,6 +645,153 @@ __global__ void postProcessBackgroundSubtraction(float* data,
 	}
 }
 
+//Background frame (B-scan) subtraction and post-FFT frame correction for line-field OCT.
+//Kernels adapted from OCTproZ; the subtraction kernels operate in place on a single data
+//pointer instead of separate __restrict__ in/out pointers (the originals were called with
+//the same buffer for both, which violates the non-aliasing promise of __restrict__).
+
+__global__ void backgroundFrameSubtractionOnly(cufftComplex* __restrict__ data,
+                                               const float* __restrict__ backgroundFrame,
+                                               const int samplesPerBscan,
+                                               const int samplesPerBuffer) {
+	int index = threadIdx.x + blockIdx.x * blockDim.x;
+	if (index < samplesPerBuffer) {
+		int posInBscan = index % samplesPerBscan;
+		data[index].x = data[index].x - backgroundFrame[posInBscan];
+		data[index].y = 0;
+	}
+}
+
+__global__ void backgroundFrameSubtractionAndNormalization(cufftComplex* __restrict__ data,
+                                                           const float* __restrict__ backgroundFrame,
+                                                           const int samplesPerBscan,
+                                                           const int samplesPerBuffer,
+                                                           const float normalizationScale) {
+	int index = threadIdx.x + blockIdx.x * blockDim.x;
+	if (index < samplesPerBuffer) {
+		int posInBscan = index % samplesPerBscan;
+		float backgroundValue = backgroundFrame[posInBscan];
+		float inputValue = data[index].x - backgroundValue;
+		backgroundValue = sqrt(backgroundValue);
+		if (backgroundValue <= 1.0f) {
+			data[index].x = inputValue;
+		} else {
+			data[index].x = normalizationScale * ((inputValue / backgroundValue));
+		}
+		data[index].y = 0;
+	}
+}
+
+// Smooths each A-scan's background spectrum with a rolling average filter (window = 2*windowRadius+1, clamped at spectrum edges)
+__global__ void smoothBackgroundSpectra(float* __restrict__ smoothed,
+                                        const float* __restrict__ backgroundFrame,
+                                        const int windowRadius,
+                                        const int samplesPerLine,
+                                        const int samplesPerBscan) {
+	int index = threadIdx.x + blockIdx.x * blockDim.x;
+	if (index < samplesPerBscan) {
+		int sampleIndex = index % samplesPerLine;
+		int firstIndexOfLine = index - sampleIndex;
+		int startIdx = max(firstIndexOfLine, index - windowRadius);
+		int endIdx = min(firstIndexOfLine + samplesPerLine - 1, index + windowRadius);
+		float sum = 0.0f;
+		for (int i = startIdx; i <= endIdx; i++) {
+			sum += backgroundFrame[i];
+		}
+		smoothed[index] = sum / (float)(endIdx - startIdx + 1);
+	}
+}
+
+// Kernel to accumulate B-scans into the background frame accumulator
+__global__ void accumulateBackgroundFrame(float* __restrict__ accumulator,
+                                          const cufftComplex* __restrict__ input,
+                                          const int samplesPerBscan,
+                                          const int bscansInBuffer) {
+	int index = threadIdx.x + blockIdx.x * blockDim.x;
+	if (index < samplesPerBscan) {
+		float sum = 0.0f;
+		// Sum across all B-scans in this buffer
+		for (int b = 0; b < bscansInBuffer; b++) {
+			sum += input[index + b * samplesPerBscan].x;
+		}
+		// Add to accumulator (atomic for thread safety across multiple calls)
+		atomicAdd(&accumulator[index], sum);
+	}
+}
+
+// Kernel to finalize the background frame by normalizing the accumulated values
+__global__ void finalizeBackgroundFrame(float* __restrict__ backgroundFrame,
+                                        const float* __restrict__ accumulator,
+                                        const float normalizationFactor,
+                                        const int samplesPerBscan) {
+	int index = threadIdx.x + blockIdx.x * blockDim.x;
+	if (index < samplesPerBscan) {
+		backgroundFrame[index] = accumulator[index] * normalizationFactor;
+	}
+}
+
+// EMA (Exponential Moving Average) continuous background update
+// Updates background using: bg = alpha*new + (1-alpha)*bg  //newer B-scans weighted higher, older ones decay but never vanish
+__global__ void updateBackgroundFrameEMA(
+    float* __restrict__ background,
+    const cufftComplex* __restrict__ input,
+    const float alpha,
+    const int samplesPerBscan,
+    const int bscansInBuffer)
+{
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (idx >= samplesPerBscan) return;
+
+	float bg = background[idx];
+	for (int b = 0; b < bscansInBuffer; b++) {
+		float newValue = input[b * samplesPerBscan + idx].x;
+		bg = alpha * newValue + (1.0f - alpha) * bg;
+	}
+	background[idx] = bg;
+}
+
+// Averages each A-scan's live spectrum to a single value (one average per A-scan, for all B-scans in the buffer)
+// One warp per A-scan: the 32 lanes read consecutive samples (coalesced) and combine their partial sums with warp shuffles
+__global__ void averageLiveSpectra(float* __restrict__ averages,
+                                   const cufftComplex* __restrict__ input,
+                                   const int samplesPerLine,
+                                   const int ascansPerBuffer) {
+	int ascanIndex = (threadIdx.x + blockIdx.x * blockDim.x) / 32;
+	int lane = threadIdx.x & 31;
+	if (ascanIndex < ascansPerBuffer) {
+		const cufftComplex* line = &input[ascanIndex * samplesPerLine];
+		float sum = 0.0f;
+		for (int s = lane; s < samplesPerLine; s += 32) {
+			sum += line[s].x;
+		}
+		//warp-level reduction of the 32 partial sums
+		for (int offset = 16; offset > 0; offset >>= 1) {
+			sum += __shfl_down_sync(0xffffffff, sum, offset);
+		}
+		if (lane == 0) {
+			averages[ascanIndex] = sum / (float)samplesPerLine;
+		}
+	}
+}
+
+// Post-FFT frame correction: divides each A-scan by the square root of its pre-subtraction spectral average (lateral flat-field)
+__global__ void normalizeAscansBySqrtSpectralAverages(cufftComplex* __restrict__ data,
+                                                      const float* __restrict__ averages,
+                                                      const float normalizationScale,
+                                                      const int samplesPerLine,
+                                                      const int samplesPerBuffer) {
+	int index = threadIdx.x + blockIdx.x * blockDim.x;
+	if (index < samplesPerBuffer) {
+		int ascanIndex = index / samplesPerLine;
+		float rootAverage = sqrt(averages[ascanIndex]);
+		if (rootAverage > 1.0f) {
+			float factor = normalizationScale / rootAverage;
+			data[index].x *= factor;
+			data[index].y *= factor;
+		}
+	}
+}
+
 
 } // namespace cuda_kernels
 } // namespace ope

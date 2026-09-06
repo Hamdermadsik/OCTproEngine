@@ -33,6 +33,13 @@ struct ProcessorConfiguration::Impl {
 	std::vector<float> backgroundProfile;
 	std::vector<float> fixedPatternNoiseProfile;
 
+	// Background frame profile (2D: samplesPerLine x ascansPerBscan) with its own dimensions.
+	// Not adjusted like the 1D curves: truncation/zero-padding would corrupt the 2D layout,
+	// so the profile is cleared instead when dimensions no longer match.
+	std::vector<float> backgroundFrameProfile;
+	int backgroundFrameSamplesPerLine = 0;
+	int backgroundFrameAscansPerBscan = 0;
+
 	Impl() = default;
 
 	Impl(const Impl& other)
@@ -46,15 +53,27 @@ struct ProcessorConfiguration::Impl {
 		, dispersionPhase(other.dispersionPhase)
 		, backgroundProfile(other.backgroundProfile)
 		, fixedPatternNoiseProfile(other.fixedPatternNoiseProfile)
+		, backgroundFrameProfile(other.backgroundFrameProfile)
+		, backgroundFrameSamplesPerLine(other.backgroundFrameSamplesPerLine)
+		, backgroundFrameAscansPerBscan(other.backgroundFrameAscansPerBscan)
 	{}
 
-	void adjustAllCurves(int signalLength) {
+	void adjustAllCurves(int signalLength, int ascansPerBscan) {
 		adjustCurve(resamplingLutOriginal, resamplingLut, signalLength);
 		adjustCurve(windowFunctionOriginal, windowFunction, signalLength);
 		adjustCurve(dispersionPhaseOriginal, dispersionPhase, signalLength);
 		adjustCurve(backgroundProfileOriginal, backgroundProfile, signalLength / 2);
 		// Fixed pattern noise is complex pairs (interleaved real/imag)
 		adjustCurve(fixedPatternNoiseProfileOriginal, fixedPatternNoiseProfile, signalLength);
+
+		// Background frame is invalidated (not resampled) on dimension mismatch
+		if (!backgroundFrameProfile.empty() &&
+			(backgroundFrameSamplesPerLine != signalLength ||
+			 backgroundFrameAscansPerBscan != ascansPerBscan)) {
+			backgroundFrameProfile.clear();
+			backgroundFrameSamplesPerLine = 0;
+			backgroundFrameAscansPerBscan = 0;
+		}
 	}
 
 private:
@@ -130,32 +149,56 @@ ProcessorConfiguration& ProcessorConfiguration::operator=(ProcessorConfiguration
 
 void ProcessorConfiguration::setResamplingLut(const std::vector<float>& data) {
 	this->impl->resamplingLutOriginal = data;
-	this->impl->adjustAllCurves(this->dataParams.signalLength);
+	this->impl->adjustAllCurves(this->dataParams.signalLength, this->dataParams.ascansPerBscan);
 	this->processingParams.resampling.useCustomLut = !data.empty();
 }
 
 void ProcessorConfiguration::setWindowFunction(const std::vector<float>& data) {
 	this->impl->windowFunctionOriginal = data;
-	this->impl->adjustAllCurves(this->dataParams.signalLength);
+	this->impl->adjustAllCurves(this->dataParams.signalLength, this->dataParams.ascansPerBscan);
 	this->processingParams.windowing.useCustomFunction = !data.empty();
 }
 
 void ProcessorConfiguration::setDispersionPhase(const std::vector<float>& data) {
 	this->impl->dispersionPhaseOriginal = data;
-	this->impl->adjustAllCurves(this->dataParams.signalLength);
+	this->impl->adjustAllCurves(this->dataParams.signalLength, this->dataParams.ascansPerBscan);
 	this->processingParams.dispersion.useCustomPhase = !data.empty();
 }
 
 void ProcessorConfiguration::setBackgroundProfile(const std::vector<float>& data) {
 	this->impl->backgroundProfileOriginal = data;
-	this->impl->adjustAllCurves(this->dataParams.signalLength);
+	this->impl->adjustAllCurves(this->dataParams.signalLength, this->dataParams.ascansPerBscan);
 	this->processingParams.background.useCustomProfile = !data.empty();
 }
 
 void ProcessorConfiguration::setFixedPatternNoiseProfile(const std::vector<float>& complexPairs) {
 	this->impl->fixedPatternNoiseProfileOriginal = complexPairs;
-	this->impl->adjustAllCurves(this->dataParams.signalLength);
+	this->impl->adjustAllCurves(this->dataParams.signalLength, this->dataParams.ascansPerBscan);
 	this->processingParams.fixedPatternNoise.useCustomProfile = !complexPairs.empty();
+}
+
+void ProcessorConfiguration::setBackgroundFrameProfile(const std::vector<float>& data, int samplesPerLine, int ascansPerBscan) {
+	if (data.empty() || data.size() != static_cast<size_t>(samplesPerLine) * static_cast<size_t>(ascansPerBscan)) {
+		this->clearBackgroundFrameProfile();
+		return;
+	}
+	this->impl->backgroundFrameProfile = data;
+	this->impl->backgroundFrameSamplesPerLine = samplesPerLine;
+	this->impl->backgroundFrameAscansPerBscan = ascansPerBscan;
+	this->impl->adjustAllCurves(this->dataParams.signalLength, this->dataParams.ascansPerBscan);
+	this->processingParams.backgroundFrame.useCustomProfile = !this->impl->backgroundFrameProfile.empty();
+}
+
+std::vector<float> ProcessorConfiguration::getBackgroundFrameProfile() const {
+	return this->impl->backgroundFrameProfile;
+}
+
+int ProcessorConfiguration::getBackgroundFrameSamplesPerLine() const {
+	return this->impl->backgroundFrameSamplesPerLine;
+}
+
+int ProcessorConfiguration::getBackgroundFrameAscansPerBscan() const {
+	return this->impl->backgroundFrameAscansPerBscan;
 }
 
 std::vector<float> ProcessorConfiguration::getResamplingLut() const {
@@ -394,6 +437,13 @@ void ProcessorConfiguration::clearFixedPatternNoiseProfile() {
 	this->processingParams.fixedPatternNoise.useCustomProfile = false;
 }
 
+void ProcessorConfiguration::clearBackgroundFrameProfile() {
+	this->impl->backgroundFrameProfile.clear();
+	this->impl->backgroundFrameSamplesPerLine = 0;
+	this->impl->backgroundFrameAscansPerBscan = 0;
+	this->processingParams.backgroundFrame.useCustomProfile = false;
+}
+
 // ============================================
 // Utility Methods
 // ============================================
@@ -418,8 +468,12 @@ bool ProcessorConfiguration::hasCustomFixedPatternNoiseProfile() const {
 	return !this->impl->fixedPatternNoiseProfileOriginal.empty();
 }
 
+bool ProcessorConfiguration::hasCustomBackgroundFrameProfile() const {
+	return !this->impl->backgroundFrameProfile.empty();
+}
+
 void ProcessorConfiguration::adjustAllCustomCurves() {
-	this->impl->adjustAllCurves(this->dataParams.signalLength);
+	this->impl->adjustAllCurves(this->dataParams.signalLength, this->dataParams.ascansPerBscan);
 }
 
 // ============================================
@@ -477,6 +531,18 @@ void ProcessorConfiguration::ioFields(std::map<std::string, std::string>& m, boo
 	IniHelper::field(m, "background.offset", this->processingParams.background.offset, saving);
 	IniHelper::field(m, "background.use_custom_profile", this->processingParams.background.useCustomProfile, saving);
 
+	// Background frame (line-field OCT)
+	IniHelper::field(m, "background_frame.enabled", this->processingParams.backgroundFrame.enabled, saving);
+	IniHelper::field(m, "background_frame.normalize", this->processingParams.backgroundFrame.normalize, saving);
+	IniHelper::field(m, "background_frame.bscans_to_average", this->processingParams.backgroundFrame.bscansToAverage, saving);
+	IniHelper::field(m, "background_frame.continuous_update", this->processingParams.backgroundFrame.continuousUpdate, saving);
+	IniHelper::field(m, "background_frame.smooth_spectra", this->processingParams.backgroundFrame.smoothSpectra, saving);
+	IniHelper::field(m, "background_frame.smoothing_window_radius", this->processingParams.backgroundFrame.smoothingWindowRadius, saving);
+	IniHelper::field(m, "background_frame.use_custom_profile", this->processingParams.backgroundFrame.useCustomProfile, saving);
+
+	// Frame correction (line-field OCT)
+	IniHelper::field(m, "frame_correction.enabled", this->processingParams.frameCorrection.enabled, saving);
+
 	// Intensity
 	IniHelper::field(m, "intensity.log_scale", this->processingParams.intensity.logScale, saving);
 	IniHelper::field(m, "intensity.range_min", this->processingParams.intensity.rangeMin, saving);
@@ -506,6 +572,8 @@ void ProcessorConfiguration::ioFields(std::map<std::string, std::string>& m, boo
 			if (!this->impl->fixedPatternNoiseProfileOriginal.empty()) {
 				IniHelper::fieldVector(m, "~custom_data.fixed_pattern_noise", this->impl->fixedPatternNoiseProfileOriginal, true);
 			}
+			// Note: the background frame is intentionally NOT embedded in the INI.
+			// Frames are only persisted as raw float32 binary via saveBackgroundFrameProfileToFile()
 		}
 	} else {
 		// When loading: depends on mode
@@ -621,6 +689,44 @@ bool ProcessorConfiguration::loadFixedPatternNoiseProfileFromFile(const std::str
 	return false;
 }
 
+// The background frame is stored as raw float32 binary (no header). The file size must
+// match the current signalLength * ascansPerBscan, which also serves as validation on load.
+bool ProcessorConfiguration::saveBackgroundFrameProfileToFile(const std::string& filepath) const {
+	if (this->impl->backgroundFrameProfile.empty()) {
+		return false;
+	}
+	std::ofstream file(filepath, std::ios::binary);
+	if (!file.is_open()) {
+		return false;
+	}
+	file.write(reinterpret_cast<const char*>(this->impl->backgroundFrameProfile.data()),
+			   this->impl->backgroundFrameProfile.size() * sizeof(float));
+	return file.good();
+}
+
+bool ProcessorConfiguration::loadBackgroundFrameProfileFromFile(const std::string& filepath) {
+	std::ifstream file(filepath, std::ios::binary | std::ios::ate);
+	if (!file.is_open()) {
+		return false;
+	}
+	std::streamsize fileSize = file.tellg();
+	file.seekg(0, std::ios::beg);
+
+	size_t expectedSamples = static_cast<size_t>(this->dataParams.signalLength) *
+							 static_cast<size_t>(this->dataParams.ascansPerBscan);
+	if (fileSize != static_cast<std::streamsize>(expectedSamples * sizeof(float))) {
+		return false;
+	}
+
+	std::vector<float> data(expectedSamples);
+	if (!file.read(reinterpret_cast<char*>(data.data()), fileSize)) {
+		return false;
+	}
+
+	this->setBackgroundFrameProfile(data, this->dataParams.signalLength, this->dataParams.ascansPerBscan);
+	return this->hasCustomBackgroundFrameProfile();
+}
+
 // ============================================
 // Validation
 // ============================================
@@ -629,6 +735,10 @@ bool ProcessorConfiguration::validate() const {
 	if (this->dataParams.signalLength <= 0 ||
 		this->dataParams.ascansPerBscan <= 0 ||
 		this->dataParams.bscansPerBuffer <= 0) {
+		return false;
+	}
+	if (this->processingParams.backgroundFrame.bscansToAverage < 1 ||
+		this->processingParams.backgroundFrame.smoothingWindowRadius < 0) {
 		return false;
 	}
 	return true;

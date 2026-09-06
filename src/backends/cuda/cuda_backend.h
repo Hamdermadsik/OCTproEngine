@@ -72,7 +72,14 @@ public:
 	void setFixedPatternNoiseProfile(const float* profileInterleaved, size_t complexPairs) override;
 	const std::vector<float>& getFixedPatternNoiseProfile() const override;
 
-	
+	// Background frame management (line-field OCT)
+	void requestBackgroundFrameRecording() override;
+	void setBackgroundFrameProfile(const float* frame, size_t samplesPerLine, size_t ascansPerBscan) override;
+	std::vector<float> getBackgroundFrameProfile() const override;
+	bool hasBackgroundFrameProfile() const override;
+	void resetBackgroundFrame() override;
+
+
 	// ============================================
 	// CUDA-Specific Configuration Methods
 	// ============================================
@@ -109,6 +116,8 @@ private:
 	void releaseDeviceBuffers();
 	void createStreamsAndEvents();
 	void destroyStreamsAndEvents();
+	void drainProcessingStreams();
+	void rebuildSmoothedBackgroundFrame();
 	void registerHostMemory();
 	void unregisterHostMemory();
 	

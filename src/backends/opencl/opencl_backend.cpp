@@ -1620,6 +1620,27 @@ const std::vector<float>& OpenClBackend::getFixedPatternNoiseProfile() const {
 	return this->impl->recordedFixedPatternNoise;
 }
 
+void OpenClBackend::requestBackgroundFrameRecording() {
+	throw std::runtime_error("Background frame recording is not yet supported on the OpenCL backend");
+}
+
+void OpenClBackend::setBackgroundFrameProfile(const float* frame, size_t samplesPerLine, size_t ascansPerBscan) {
+	// Stored host-side only so configuration save/load and backend switching preserve the profile
+	this->backgroundFrameProfile.assign(frame, frame + samplesPerLine * ascansPerBscan);
+}
+
+std::vector<float> OpenClBackend::getBackgroundFrameProfile() const {
+	return this->backgroundFrameProfile;
+}
+
+bool OpenClBackend::hasBackgroundFrameProfile() const {
+	return !this->backgroundFrameProfile.empty();
+}
+
+void OpenClBackend::resetBackgroundFrame() {
+	this->backgroundFrameProfile.clear();
+}
+
 void CL_CALLBACK OpenClBackend::returnBufferCallback(cl_event event, cl_int status, void* userData) {
 	if (status != CL_COMPLETE) {
 		return;

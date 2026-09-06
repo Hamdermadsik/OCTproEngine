@@ -291,6 +291,77 @@ __global__ void postProcessBackgroundSubtraction(
 	int samplesPerBuffer
 );
 
+// ============================================
+// Background Frame Subtraction Kernels (Line-Field OCT)
+// ============================================
+// Note: unlike the OCTproZ originals these subtraction kernels operate in place on a
+// single data pointer. The originals declare separate __restrict__ in/out pointers but
+// are called with the same buffer for both, which violates the non-aliasing promise.
+
+__global__ void backgroundFrameSubtractionOnly(
+	cufftComplex* __restrict__ data,
+	const float* __restrict__ backgroundFrame,
+	int samplesPerBscan,
+	int samplesPerBuffer
+);
+
+__global__ void backgroundFrameSubtractionAndNormalization(
+	cufftComplex* __restrict__ data,
+	const float* __restrict__ backgroundFrame,
+	int samplesPerBscan,
+	int samplesPerBuffer,
+	float normalizationScale
+);
+
+__global__ void smoothBackgroundSpectra(
+	float* __restrict__ smoothed,
+	const float* __restrict__ backgroundFrame,
+	int windowRadius,
+	int samplesPerLine,
+	int samplesPerBscan
+);
+
+__global__ void accumulateBackgroundFrame(
+	float* __restrict__ accumulator,
+	const cufftComplex* __restrict__ input,
+	int samplesPerBscan,
+	int bscansInBuffer
+);
+
+__global__ void finalizeBackgroundFrame(
+	float* __restrict__ backgroundFrame,
+	const float* __restrict__ accumulator,
+	float normalizationFactor,
+	int samplesPerBscan
+);
+
+__global__ void updateBackgroundFrameEMA(
+	float* __restrict__ background,
+	const cufftComplex* __restrict__ input,
+	float alpha,
+	int samplesPerBscan,
+	int bscansInBuffer
+);
+
+// ============================================
+// Post-FFT Frame Correction Kernels (Line-Field OCT)
+// ============================================
+
+__global__ void averageLiveSpectra(
+	float* __restrict__ averages,
+	const cufftComplex* __restrict__ input,
+	int samplesPerLine,
+	int ascansPerBuffer
+);
+
+__global__ void normalizeAscansBySqrtSpectralAverages(
+	cufftComplex* __restrict__ data,
+	const float* __restrict__ averages,
+	float normalizationScale,
+	int samplesPerLine,
+	int samplesPerBuffer
+);
+
 } // namespace cuda_kernels
 } // namespace ope
 

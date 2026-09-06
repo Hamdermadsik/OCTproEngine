@@ -75,6 +75,14 @@ public:
 	void setFixedPatternNoiseProfile(const float* profileInterleaved, size_t complexPairs) override;
 	const std::vector<float>& getFixedPatternNoiseProfile() const override;
 
+	// Background frame management (line-field OCT) - processing is not yet implemented on this
+	// backend; the profile is stored host-side so save/load and backend switching keep working
+	void requestBackgroundFrameRecording() override;
+	void setBackgroundFrameProfile(const float* frame, size_t samplesPerLine, size_t ascansPerBscan) override;
+	std::vector<float> getBackgroundFrameProfile() const override;
+	bool hasBackgroundFrameProfile() const override;
+	void resetBackgroundFrame() override;
+
 
 	// ============================================
 	// Vulkan-Specific Configuration Methods
@@ -107,6 +115,9 @@ public:
 private:
 	struct Impl;
 	std::unique_ptr<Impl> impl;
+
+	// Host-side background frame storage (no device processing yet)
+	std::vector<float> backgroundFrameProfile;
 
 	// Helper methods
 	void checkVulkanError(VkResult result, const char* context);
