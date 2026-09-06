@@ -246,20 +246,6 @@ void initializeProcessor(AppState* state) {
 			               (state->dataParams.backend == ope::Backend::OPENCL ? "OpenCL" : "Vulkan")))
 			          << " (preserving profiles)..." << std::endl;
 
-			// Line-field OCT features are not supported on OpenCL/Vulkan: disable them on the
-			// processor before switching (UI booleans alone do not satisfy setBackend()'s check)
-			bool targetSupportsLineField = (state->dataParams.backend == ope::Backend::CPU ||
-			                                state->dataParams.backend == ope::Backend::CUDA);
-			if (!targetSupportsLineField &&
-				(state->procParams.backgroundFrameSubtraction || state->procParams.postFftFrameCorrection)) {
-				std::cout << "Disabling background frame subtraction and frame correction "
-				          << "(not supported on the selected backend)" << std::endl;
-				state->processor->enableBackgroundFrameSubtraction(false);
-				state->processor->enablePostFftFrameCorrection(false);
-				state->procParams.backgroundFrameSubtraction = false;
-				state->procParams.postFftFrameCorrection = false;
-			}
-
 			try {
 				state->processor->setBackend(state->dataParams.backend);
 			} catch (const std::exception& e) {
