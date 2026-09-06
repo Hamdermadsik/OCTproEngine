@@ -60,6 +60,18 @@ extern const char* KERNEL_SINUSOIDAL_SCAN_CORRECTION;
 extern const char* KERNEL_GET_POST_PROCESS_BACKGROUND;
 extern const char* KERNEL_POST_PROCESS_BACKGROUND_SUBTRACTION;
 
+// Background frame subtraction (line-field OCT)
+extern const char* KERNEL_BACKGROUND_FRAME_SUBTRACTION_ONLY;
+extern const char* KERNEL_BACKGROUND_FRAME_SUBTRACTION_AND_NORMALIZATION;
+extern const char* KERNEL_SMOOTH_BACKGROUND_SPECTRA;
+extern const char* KERNEL_ACCUMULATE_BACKGROUND_FRAME;
+extern const char* KERNEL_FINALIZE_BACKGROUND_FRAME;
+extern const char* KERNEL_UPDATE_BACKGROUND_FRAME_EMA;
+
+// Post-FFT frame correction (line-field OCT)
+extern const char* KERNEL_AVERAGE_LIVE_SPECTRA;
+extern const char* KERNEL_NORMALIZE_ASCANS_BY_SQRT_SPECTRAL_AVERAGES;
+
 // ============================================
 // OpenCL Kernel Source Code
 // ============================================

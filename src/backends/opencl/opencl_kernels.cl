@@ -763,3 +763,173 @@ __kernel void postProcessBackgroundSubtraction(
 	//	In-place modification: subtract background from data
 	data[index] = data[index] - (backgroundWeight * background[index % samplesPerAscan] + backgroundOffset);
 }
+
+// ============================================
+// Background Frame Subtraction Kernels (Line-Field OCT)
+// ============================================
+//	Ported from the CUDA kernels; the subtraction kernels operate in place
+
+__kernel void backgroundFrameSubtractionOnly(
+	__global float2* data,
+	__global const float* backgroundFrame,
+	const int samplesPerBscan,
+	const int samplesPerBuffer)
+{
+	int index = get_global_id(0);
+	if (index >= samplesPerBuffer) return;
+
+	int posInBscan = index % samplesPerBscan;
+	data[index] = (float2)(data[index].x - backgroundFrame[posInBscan], 0.0f);
+}
+
+__kernel void backgroundFrameSubtractionAndNormalization(
+	__global float2* data,
+	__global const float* backgroundFrame,
+	const int samplesPerBscan,
+	const int samplesPerBuffer,
+	const float normalizationScale)
+{
+	int index = get_global_id(0);
+	if (index >= samplesPerBuffer) return;
+
+	int posInBscan = index % samplesPerBscan;
+	float backgroundValue = backgroundFrame[posInBscan];
+	float inputValue = data[index].x - backgroundValue;
+	backgroundValue = sqrt(backgroundValue);
+	if (backgroundValue > 1.0f) {
+		inputValue = normalizationScale * (inputValue / backgroundValue);
+	}
+	data[index] = (float2)(inputValue, 0.0f);
+}
+
+//	Smooths each A-scan's background spectrum with a rolling average filter (window = 2*windowRadius+1, clamped at spectrum edges)
+__kernel void smoothBackgroundSpectra(
+	__global float* smoothed,
+	__global const float* backgroundFrame,
+	const int windowRadius,
+	const int samplesPerLine,
+	const int samplesPerBscan)
+{
+	int index = get_global_id(0);
+	if (index >= samplesPerBscan) return;
+
+	int sampleIndex = index % samplesPerLine;
+	int firstIndexOfLine = index - sampleIndex;
+	int startIdx = max(firstIndexOfLine, index - windowRadius);
+	int endIdx = min(firstIndexOfLine + samplesPerLine - 1, index + windowRadius);
+	float sum = 0.0f;
+	for (int i = startIdx; i <= endIdx; i++) {
+		sum += backgroundFrame[i];
+	}
+	smoothed[index] = sum / (float)(endIdx - startIdx + 1);
+}
+
+//	Accumulates the B-scans of this buffer into the background frame accumulator.
+//	Plain additions suffice: one work item owns each background sample, and successive
+//	buffers are ordered through the background stage event chain
+__kernel void accumulateBackgroundFrame(
+	__global float* accumulator,
+	__global const float2* input,
+	const int samplesPerBscan,
+	const int bscansInBuffer)
+{
+	int index = get_global_id(0);
+	if (index >= samplesPerBscan) return;
+
+	float sum = 0.0f;
+	for (int b = 0; b < bscansInBuffer; b++) {
+		sum += input[index + b * samplesPerBscan].x;
+	}
+	accumulator[index] += sum;
+}
+
+__kernel void finalizeBackgroundFrame(
+	__global float* backgroundFrame,
+	__global const float* accumulator,
+	const float normalizationFactor,
+	const int samplesPerBscan)
+{
+	int index = get_global_id(0);
+	if (index >= samplesPerBscan) return;
+
+	backgroundFrame[index] = accumulator[index] * normalizationFactor;
+}
+
+//	EMA (Exponential Moving Average) continuous background update
+//	Folds ALL B-scans of the buffer into the background in their input order
+__kernel void updateBackgroundFrameEMA(
+	__global float* background,
+	__global const float2* input,
+	const float alpha,
+	const int samplesPerBscan,
+	const int bscansInBuffer)
+{
+	int index = get_global_id(0);
+	if (index >= samplesPerBscan) return;
+
+	float bg = background[index];
+	for (int b = 0; b < bscansInBuffer; b++) {
+		float newValue = input[b * samplesPerBscan + index].x;
+		bg = alpha * newValue + (1.0f - alpha) * bg;
+	}
+	background[index] = bg;
+}
+
+// ============================================
+// Post-FFT Frame Correction Kernels (Line-Field OCT)
+// ============================================
+
+//	Averages each A-scan's live spectrum to a single value. One workgroup per A-scan
+//	with strided reads and a local-memory reduction (portable, no warp assumptions)
+__kernel void averageLiveSpectra(
+	__global float* averages,
+	__global const float2* input,
+	const int samplesPerLine,
+	const int ascansPerBuffer,
+	__local float* scratch)
+{
+	int ascanIndex = get_group_id(0);
+	int lid = get_local_id(0);
+	int localSize = get_local_size(0);
+	if (ascanIndex >= ascansPerBuffer) return;
+
+	float sum = 0.0f;
+	for (int s = lid; s < samplesPerLine; s += localSize) {
+		sum += input[ascanIndex * samplesPerLine + s].x;
+	}
+	scratch[lid] = sum;
+	barrier(CLK_LOCAL_MEM_FENCE);
+
+	//	Tree reduction that also handles non-power-of-two workgroup sizes
+	//	(note: "half" is a reserved OpenCL C type name)
+	for (int active = localSize; active > 1; ) {
+		int upperCount = (active + 1) / 2;
+		if (lid < active - upperCount) {
+			scratch[lid] += scratch[lid + upperCount];
+		}
+		barrier(CLK_LOCAL_MEM_FENCE);
+		active = upperCount;
+	}
+	if (lid == 0) {
+		averages[ascanIndex] = scratch[0] / (float)samplesPerLine;
+	}
+}
+
+//	Post-FFT frame correction: divides each A-scan by the square root of its pre-subtraction spectral average (lateral flat-field)
+__kernel void normalizeAscansBySqrtSpectralAverages(
+	__global float2* data,
+	__global const float* averages,
+	const float normalizationScale,
+	const int samplesPerLine,
+	const int samplesPerBuffer)
+{
+	int index = get_global_id(0);
+	if (index >= samplesPerBuffer) return;
+
+	int ascanIndex = index / samplesPerLine;
+	float rootAverage = sqrt(averages[ascanIndex]);
+	if (rootAverage > 1.0f) {
+		float factor = normalizationScale / rootAverage;
+		data[index] *= factor;
+	}
+}

@@ -695,22 +695,23 @@ void testBackendSwitchTransfer() {
 	}
 }
 
-// Enabling on OpenCL/Vulkan must throw without changing configuration
+// Enabling on a backend without line-field support must throw without changing
+// configuration (Vulkan is the remaining unsupported backend)
 void testUnsupportedBackendRejection() {
-	std::cout << "  Unsupported backend rejection (OpenCL)..." << std::endl;
-	if (!ope::BackendUtils::isOpenCLAvailable()) {
-		std::cout << "    [SKIPPED] no OpenCL runtime available" << std::endl;
+	std::cout << "  Unsupported backend rejection (Vulkan)..." << std::endl;
+	if (!ope::BackendUtils::isVulkanAvailable()) {
+		std::cout << "    [SKIPPED] no Vulkan runtime available" << std::endl;
 		return;
 	}
 
-	ope::Processor processor(ope::Backend::OPENCL);
+	ope::Processor processor(ope::Backend::VULKAN);
 	bool threw = false;
 	try {
 		processor.enableBackgroundFrameSubtraction(true);
 	} catch (const std::runtime_error&) {
 		threw = true;
 	}
-	TEST_ASSERT(threw, "Enabling background frame subtraction on OpenCL must throw");
+	TEST_ASSERT(threw, "Enabling background frame subtraction on Vulkan must throw");
 	TEST_ASSERT(!processor.getConfig().processingParams.backgroundFrame.enabled,
 		"Rejected enable must not change the configuration");
 
@@ -720,7 +721,7 @@ void testUnsupportedBackendRejection() {
 	} catch (const std::runtime_error&) {
 		threwCorrection = true;
 	}
-	TEST_ASSERT(threwCorrection, "Enabling frame correction on OpenCL must throw");
+	TEST_ASSERT(threwCorrection, "Enabling frame correction on Vulkan must throw");
 }
 
 // Reset must work on passive backends, and a rejected backend switch must leave
@@ -733,7 +734,7 @@ void testResetAndRejectedSwitchConsistency() {
 	processor.enableBackgroundFrameSubtraction(true);
 	bool threw = false;
 	try {
-		processor.setBackendConfig(ope::OpenCLConfig());
+		processor.setBackendConfig(ope::VulkanConfig());
 	} catch (const std::runtime_error&) {
 		threw = true;
 	}
@@ -870,10 +871,10 @@ void testRecordedProfilesExportAfterSwitch() {
 	std::remove(bgFile.c_str());
 }
 
-// CUDA multi-stream determinism: with continuous EMA and mid-run transitions the CUDA
-// output sequence (3 streams by default) must match the strictly serial CPU backend
-void testCudaSequenceMatchesCpu() {
-	std::cout << "  CUDA multi-stream sequence vs serial CPU (continuous EMA + transitions)..." << std::endl;
+// GPU multi-queue determinism: with continuous EMA and mid-run transitions the GPU
+// output sequence must match the strictly serial CPU backend
+void testSequenceMatchesCpu(ope::Backend backend, const char* name) {
+	std::cout << "  " << name << " multi-queue sequence vs serial CPU (continuous EMA + transitions)..." << std::endl;
 
 	const int numBuffers = 30;
 	std::vector<std::vector<uint16_t>> inputs;
@@ -909,19 +910,14 @@ void testCudaSequenceMatchesCpu() {
 		return outputs;
 	};
 
-	if (!ope::BackendUtils::isCudaAvailable()) {
-		std::cout << "    [SKIPPED] no CUDA device available" << std::endl;
-		return;
-	}
-
 	std::vector<std::vector<float>> cpuOutputs = runSequence(ope::Backend::CPU);
-	std::vector<std::vector<float>> cudaOutputs = runSequence(ope::Backend::CUDA);
+	std::vector<std::vector<float>> gpuOutputs = runSequence(backend);
 
-	TEST_ASSERT(cpuOutputs.size() == cudaOutputs.size(), "Both backends must deliver all buffers");
+	TEST_ASSERT(cpuOutputs.size() == gpuOutputs.size(), "Both backends must deliver all buffers");
 	for (size_t n = 0; n < cpuOutputs.size(); ++n) {
 		for (size_t i = 0; i < cpuOutputs[n].size(); ++i) {
-			TEST_ASSERT(nearlyEqual(cpuOutputs[n][i], cudaOutputs[n][i], 0.05f),
-				"CUDA multi-stream output must match the serial CPU reference (buffer " +
+			TEST_ASSERT(nearlyEqual(cpuOutputs[n][i], gpuOutputs[n][i], 0.05f),
+				std::string(name) + " multi-queue output must match the serial CPU reference (buffer " +
 				std::to_string(n) + ", sample " + std::to_string(i) + ")");
 		}
 	}
@@ -958,6 +954,12 @@ int main() {
 			std::cout << "  [SKIPPED] CUDA suite: no CUDA device available" << std::endl;
 		}
 
+		if (ope::BackendUtils::isOpenCLAvailable()) {
+			runBackendSuite(ope::Backend::OPENCL, "OpenCL");
+		} else {
+			std::cout << "  [SKIPPED] OpenCL suite: no OpenCL runtime available" << std::endl;
+		}
+
 		std::cout << "\n=== Cross-backend ===" << std::endl;
 		testValidationRejection();
 		testBackendSwitchTransfer();
@@ -966,7 +968,12 @@ int main() {
 		testFailedSwitchKeepsAccurateMetadata();
 		testFailedSwitchKeepsCalibrationRecoverable();
 		testRecordedProfilesExportAfterSwitch();
-		testCudaSequenceMatchesCpu();
+		if (ope::BackendUtils::isCudaAvailable()) {
+			testSequenceMatchesCpu(ope::Backend::CUDA, "CUDA");
+		}
+		if (ope::BackendUtils::isOpenCLAvailable()) {
+			testSequenceMatchesCpu(ope::Backend::OPENCL, "OpenCL");
+		}
 
 		std::cout << "\nAll background frame tests passed" << std::endl;
 		return 0;

@@ -119,6 +119,14 @@ struct OpenClBackend::Impl {
 	cl_kernel kernelSinusoidalScanCorrection = nullptr;
 	cl_kernel kernelGetPostProcessBackground = nullptr;
 	cl_kernel kernelPostProcessBackgroundSubtraction = nullptr;
+	cl_kernel kernelBackgroundFrameSubtractionOnly = nullptr;
+	cl_kernel kernelBackgroundFrameSubtractionAndNormalization = nullptr;
+	cl_kernel kernelSmoothBackgroundSpectra = nullptr;
+	cl_kernel kernelAccumulateBackgroundFrame = nullptr;
+	cl_kernel kernelFinalizeBackgroundFrame = nullptr;
+	cl_kernel kernelUpdateBackgroundFrameEMA = nullptr;
+	cl_kernel kernelAverageLiveSpectra = nullptr;
+	cl_kernel kernelNormalizeAscansBySqrtSpectralAverages = nullptr;
 
 	//	Data dimensions
 	int signalLength = 0;
@@ -162,6 +170,21 @@ struct OpenClBackend::Impl {
 	bool postProcessBackgroundRecordingRequested = false;
 	bool postProcessBackgroundUpdated = false;
 	std::vector<float> recordedPostProcessBackground;
+
+	//	Background frame (line-field OCT). The three frames are shared across queues;
+	//	writes are ordered via the backgroundStageDone event chain in process() and via
+	//	drainProcessingQueues() at transitions (mode changes, profile upload, reset)
+	cl_mem d_backgroundFrame = nullptr;          //	samplesPerBscan floats
+	cl_mem d_backgroundSmoothedFrame = nullptr;  //	cached smoothed copy of d_backgroundFrame
+	cl_mem d_backgroundAccumulator = nullptr;    //	recording accumulator
+	std::vector<cl_mem> d_liveSpectralAverages;  //	per-queue scratch, one value per A-scan
+	std::vector<float> recordedBackgroundFrame;  //	host mirror, refreshed on finalize/setProfile
+	bool backgroundFrameValid = false;
+	bool backgroundRecordingInProgress = false;
+	int backgroundBscansRecorded = 0;
+	int backgroundBscansTarget = 0;              //	latched at requestBackgroundFrameRecording()
+	bool smoothedFrameDirty = true;
+	cl_event backgroundStageDone = nullptr;
 
 	//	VkFFT
 	VkFFTConfiguration fftConfig;
@@ -509,6 +532,30 @@ void OpenClBackend::loadAndBuildKernels() {
 
 	this->impl->kernelPostProcessBackgroundSubtraction = clCreateKernel(this->impl->program, ope::opencl::KERNEL_POST_PROCESS_BACKGROUND_SUBTRACTION, &err);
 	checkOpenClError(err, "create postProcessBackgroundSubtraction kernel");
+
+	this->impl->kernelBackgroundFrameSubtractionOnly = clCreateKernel(this->impl->program, ope::opencl::KERNEL_BACKGROUND_FRAME_SUBTRACTION_ONLY, &err);
+	checkOpenClError(err, "create backgroundFrameSubtractionOnly kernel");
+
+	this->impl->kernelBackgroundFrameSubtractionAndNormalization = clCreateKernel(this->impl->program, ope::opencl::KERNEL_BACKGROUND_FRAME_SUBTRACTION_AND_NORMALIZATION, &err);
+	checkOpenClError(err, "create backgroundFrameSubtractionAndNormalization kernel");
+
+	this->impl->kernelSmoothBackgroundSpectra = clCreateKernel(this->impl->program, ope::opencl::KERNEL_SMOOTH_BACKGROUND_SPECTRA, &err);
+	checkOpenClError(err, "create smoothBackgroundSpectra kernel");
+
+	this->impl->kernelAccumulateBackgroundFrame = clCreateKernel(this->impl->program, ope::opencl::KERNEL_ACCUMULATE_BACKGROUND_FRAME, &err);
+	checkOpenClError(err, "create accumulateBackgroundFrame kernel");
+
+	this->impl->kernelFinalizeBackgroundFrame = clCreateKernel(this->impl->program, ope::opencl::KERNEL_FINALIZE_BACKGROUND_FRAME, &err);
+	checkOpenClError(err, "create finalizeBackgroundFrame kernel");
+
+	this->impl->kernelUpdateBackgroundFrameEMA = clCreateKernel(this->impl->program, ope::opencl::KERNEL_UPDATE_BACKGROUND_FRAME_EMA, &err);
+	checkOpenClError(err, "create updateBackgroundFrameEMA kernel");
+
+	this->impl->kernelAverageLiveSpectra = clCreateKernel(this->impl->program, ope::opencl::KERNEL_AVERAGE_LIVE_SPECTRA, &err);
+	checkOpenClError(err, "create averageLiveSpectra kernel");
+
+	this->impl->kernelNormalizeAscansBySqrtSpectralAverages = clCreateKernel(this->impl->program, ope::opencl::KERNEL_NORMALIZE_ASCANS_BY_SQRT_SPECTRAL_AVERAGES, &err);
+	checkOpenClError(err, "create normalizeAscansBySqrtSpectralAverages kernel");
 }
 
 void OpenClBackend::releaseKernels() {
@@ -535,6 +582,14 @@ void OpenClBackend::releaseKernels() {
 	if (this->impl->kernelSinusoidalScanCorrection) { clReleaseKernel(this->impl->kernelSinusoidalScanCorrection); this->impl->kernelSinusoidalScanCorrection = nullptr; }
 	if (this->impl->kernelGetPostProcessBackground) { clReleaseKernel(this->impl->kernelGetPostProcessBackground); this->impl->kernelGetPostProcessBackground = nullptr; }
 	if (this->impl->kernelPostProcessBackgroundSubtraction) { clReleaseKernel(this->impl->kernelPostProcessBackgroundSubtraction); this->impl->kernelPostProcessBackgroundSubtraction = nullptr; }
+	if (this->impl->kernelBackgroundFrameSubtractionOnly) { clReleaseKernel(this->impl->kernelBackgroundFrameSubtractionOnly); this->impl->kernelBackgroundFrameSubtractionOnly = nullptr; }
+	if (this->impl->kernelBackgroundFrameSubtractionAndNormalization) { clReleaseKernel(this->impl->kernelBackgroundFrameSubtractionAndNormalization); this->impl->kernelBackgroundFrameSubtractionAndNormalization = nullptr; }
+	if (this->impl->kernelSmoothBackgroundSpectra) { clReleaseKernel(this->impl->kernelSmoothBackgroundSpectra); this->impl->kernelSmoothBackgroundSpectra = nullptr; }
+	if (this->impl->kernelAccumulateBackgroundFrame) { clReleaseKernel(this->impl->kernelAccumulateBackgroundFrame); this->impl->kernelAccumulateBackgroundFrame = nullptr; }
+	if (this->impl->kernelFinalizeBackgroundFrame) { clReleaseKernel(this->impl->kernelFinalizeBackgroundFrame); this->impl->kernelFinalizeBackgroundFrame = nullptr; }
+	if (this->impl->kernelUpdateBackgroundFrameEMA) { clReleaseKernel(this->impl->kernelUpdateBackgroundFrameEMA); this->impl->kernelUpdateBackgroundFrameEMA = nullptr; }
+	if (this->impl->kernelAverageLiveSpectra) { clReleaseKernel(this->impl->kernelAverageLiveSpectra); this->impl->kernelAverageLiveSpectra = nullptr; }
+	if (this->impl->kernelNormalizeAscansBySqrtSpectralAverages) { clReleaseKernel(this->impl->kernelNormalizeAscansBySqrtSpectralAverages); this->impl->kernelNormalizeAscansBySqrtSpectralAverages = nullptr; }
 
 	if (this->impl->program) {
 		clReleaseProgram(this->impl->program);
@@ -619,6 +674,32 @@ void OpenClBackend::allocateDeviceBuffers() {
 		checkOpenClErrors(clEnqueueNDRangeKernel(this->impl->commandQueues[0], this->impl->kernelFillSinusoidalScanCorrectionCurve, 1, nullptr, &globalWorkSize, nullptr, 0, nullptr, nullptr));
 		checkOpenClErrors(clFinish(this->impl->commandQueues[0]));
 	}
+
+	//	Background frame buffers (line-field OCT). Preallocated unconditionally so the
+	//	feature can be enabled at runtime without reinitialization
+	size_t samplesPerBscanSize = static_cast<size_t>(this->impl->signalLength) * this->impl->ascansPerBscan * sizeof(float);
+	this->impl->d_backgroundFrame = clCreateBuffer(this->impl->context, CL_MEM_READ_WRITE, samplesPerBscanSize, nullptr, &err);
+	checkOpenClError(err, "create background frame buffer");
+	this->impl->d_backgroundSmoothedFrame = clCreateBuffer(this->impl->context, CL_MEM_READ_WRITE, samplesPerBscanSize, nullptr, &err);
+	checkOpenClError(err, "create smoothed background frame buffer");
+	this->impl->d_backgroundAccumulator = clCreateBuffer(this->impl->context, CL_MEM_READ_WRITE, samplesPerBscanSize, nullptr, &err);
+	checkOpenClError(err, "create background accumulator buffer");
+
+	//	Initialize frame and accumulator to zero
+	float zero = 0.0f;
+	checkOpenClErrors(clEnqueueFillBuffer(this->impl->commandQueues[0], this->impl->d_backgroundFrame,
+		&zero, sizeof(float), 0, samplesPerBscanSize, 0, nullptr, nullptr));
+	checkOpenClErrors(clEnqueueFillBuffer(this->impl->commandQueues[0], this->impl->d_backgroundAccumulator,
+		&zero, sizeof(float), 0, samplesPerBscanSize, 0, nullptr, nullptr));
+	checkOpenClErrors(clFinish(this->impl->commandQueues[0]));
+
+	//	Per-queue spectral average scratch for post-FFT frame correction
+	size_t averagesSize = static_cast<size_t>(this->impl->ascansPerBscan) * this->impl->bscansPerBuffer * sizeof(float);
+	this->impl->d_liveSpectralAverages.resize(this->impl->numCommandQueues);
+	for (int i = 0; i < this->impl->numCommandQueues; i++) {
+		this->impl->d_liveSpectralAverages[i] = clCreateBuffer(this->impl->context, CL_MEM_READ_WRITE, averagesSize, nullptr, &err);
+		checkOpenClError(err, "create live spectral averages buffer");
+	}
 }
 
 void OpenClBackend::releaseDeviceBuffers() {
@@ -653,6 +734,16 @@ void OpenClBackend::releaseDeviceBuffers() {
 	if (this->impl->d_meanALine) { clReleaseMemObject(this->impl->d_meanALine); this->impl->d_meanALine = nullptr; }
 	if (this->impl->d_postProcBackgroundLine) { clReleaseMemObject(this->impl->d_postProcBackgroundLine); this->impl->d_postProcBackgroundLine = nullptr; }
 	if (this->impl->d_sinusoidalResampleCurve) { clReleaseMemObject(this->impl->d_sinusoidalResampleCurve); this->impl->d_sinusoidalResampleCurve = nullptr; }
+
+	if (this->impl->d_backgroundFrame) { clReleaseMemObject(this->impl->d_backgroundFrame); this->impl->d_backgroundFrame = nullptr; }
+	if (this->impl->d_backgroundSmoothedFrame) { clReleaseMemObject(this->impl->d_backgroundSmoothedFrame); this->impl->d_backgroundSmoothedFrame = nullptr; }
+	if (this->impl->d_backgroundAccumulator) { clReleaseMemObject(this->impl->d_backgroundAccumulator); this->impl->d_backgroundAccumulator = nullptr; }
+	for (auto& buf : this->impl->d_liveSpectralAverages) {
+		if (buf) { clReleaseMemObject(buf); buf = nullptr; }
+	}
+	this->impl->d_liveSpectralAverages.clear();
+
+	if (this->impl->backgroundStageDone) { clReleaseEvent(this->impl->backgroundStageDone); this->impl->backgroundStageDone = nullptr; }
 }
 
 void OpenClBackend::registerHostMemory() {
@@ -870,11 +961,21 @@ void OpenClBackend::initialize(const ProcessorConfiguration& config) {
 			this->impl->signalLength * 2 * sizeof(float), hostMeanInterleaved.data(), 0, nullptr, nullptr));
 		this->impl->fixedPatternNoiseDetermined = true;
 	}
-	// Re-seed the host-side background frame from the configuration: clears a frame that
-	// went stale through a dimension change and restores a valid one across reinitialization
-	this->backgroundFrameProfile = config.hasCustomBackgroundFrameProfile()
-		? config.getBackgroundFrameProfile()
-		: std::vector<float>();
+	//	Reset background frame state
+	this->impl->backgroundFrameValid = false;
+	this->impl->backgroundRecordingInProgress = false;
+	this->impl->backgroundBscansRecorded = 0;
+	this->impl->backgroundBscansTarget = 0;
+	this->impl->smoothedFrameDirty = true;
+	this->impl->recordedBackgroundFrame.clear();
+	if (config.hasCustomBackgroundFrameProfile()) {
+		std::vector<float> frameVec = config.getBackgroundFrameProfile();
+		this->impl->recordedBackgroundFrame = frameVec;
+		checkOpenClErrors(clEnqueueWriteBuffer(this->impl->commandQueues[0], this->impl->d_backgroundFrame, CL_TRUE, 0,
+			frameVec.size() * sizeof(float), frameVec.data(), 0, nullptr, nullptr));
+		this->impl->backgroundFrameValid = true;
+		this->rebuildSmoothedBackgroundFrame();
+	}
 
 	//	Start callback worker thread for ordered callback delivery
 	//	Multiple command queues can complete out of order, this ensures callbacks are delivered in submission order
@@ -1087,6 +1188,154 @@ void OpenClBackend::process(IOBuffer& input) {
 	checkOpenClErrors(clSetKernelArg(inputKernel, 5, sizeof(int), &samplesPerBuffer));
 	checkOpenClErrors(clEnqueueNDRangeKernel(queue, inputKernel, 1, nullptr, &globalWorkSize, &localWorkSize, 0, nullptr, nullptr));
 
+	//	Step 1.5: Line-field OCT preprocessing (spectral averages, background frame recording/EMA/subtraction)
+	const ProcessorConfiguration::ProcessingParameters::BackgroundFrame& bfParams =
+		config.processingParams.backgroundFrame;
+	bool frameCorrection = config.processingParams.frameCorrection.enabled;
+	const int samplesPerBscan = signalLength * ascansPerBscan;
+	const int ascansPerBuffer = ascansPerBscan * bscansPerBuffer;
+	float frameNormalizationScale = sqrtf(powf(2.0f, static_cast<float>(bitDepth)));
+
+	if (frameCorrection) {
+		//	Live per-A-scan spectral averages for post-FFT frame correction (must be computed
+		//	before background subtraction removes the DC content). One workgroup per A-scan
+		size_t avgLocalSize = localWorkSize;
+		size_t avgGlobalSize = static_cast<size_t>(ascansPerBuffer) * avgLocalSize;
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelAverageLiveSpectra, 0, sizeof(cl_mem), &this->impl->d_liveSpectralAverages[queueIndex]));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelAverageLiveSpectra, 1, sizeof(cl_mem), &d_fftBuffer));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelAverageLiveSpectra, 2, sizeof(int), &signalLength));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelAverageLiveSpectra, 3, sizeof(int), &ascansPerBuffer));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelAverageLiveSpectra, 4, avgLocalSize * sizeof(float), nullptr));  // __local memory
+		checkOpenClErrors(clEnqueueNDRangeKernel(queue, this->impl->kernelAverageLiveSpectra, 1, nullptr, &avgGlobalSize, &avgLocalSize, 0, nullptr, nullptr));
+	}
+
+	//	Continuous EMA only runs together with subtraction (matches CUDA/OCTproZ).
+	//	Recording takes precedence: EMA is suppressed while a recording is in progress and
+	//	resumes on the next buffer, seeded by the freshly recorded frame
+	bool backgroundContinuous = bfParams.continuousUpdate && bfParams.enabled &&
+		!this->impl->backgroundRecordingInProgress;
+	bool backgroundWritersActive = backgroundContinuous || this->impl->backgroundRecordingInProgress;
+	bool backgroundStageActive = backgroundWritersActive ||
+		(bfParams.enabled && this->impl->backgroundFrameValid);
+
+	//	Serialize the background stage across queues: make this queue wait on the last
+	//	writer's event (recorded and flushed on its producer queue), record a new event
+	//	only when writing. The static steady state issues no waits or events at all
+	if (backgroundStageActive && this->impl->backgroundStageDone != nullptr) {
+		checkOpenClErrors(clEnqueueBarrierWithWaitList(queue, 1, &this->impl->backgroundStageDone, nullptr));
+	}
+
+	size_t bgGlobalSize = samplesPerBscan;
+	if (bgGlobalSize % localWorkSize != 0) {
+		bgGlobalSize = ((bgGlobalSize + localWorkSize - 1) / localWorkSize) * localWorkSize;
+	}
+
+	//	Background frame recording (accumulates across buffers; a recording that completes
+	//	here applies starting with the current buffer)
+	if (this->impl->backgroundRecordingInProgress) {
+		//	The target is latched at request time: changing the averaging setting
+		//	mid-recording must not corrupt the count or the normalization
+		int bscansRemaining = this->impl->backgroundBscansTarget - this->impl->backgroundBscansRecorded;
+		int bscansToProcess = std::min(bscansPerBuffer, bscansRemaining);
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelAccumulateBackgroundFrame, 0, sizeof(cl_mem), &this->impl->d_backgroundAccumulator));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelAccumulateBackgroundFrame, 1, sizeof(cl_mem), &d_fftBuffer));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelAccumulateBackgroundFrame, 2, sizeof(int), &samplesPerBscan));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelAccumulateBackgroundFrame, 3, sizeof(int), &bscansToProcess));
+		checkOpenClErrors(clEnqueueNDRangeKernel(queue, this->impl->kernelAccumulateBackgroundFrame, 1, nullptr, &bgGlobalSize, &localWorkSize, 0, nullptr, nullptr));
+		this->impl->backgroundBscansRecorded += bscansToProcess;
+
+		if (this->impl->backgroundBscansRecorded >= this->impl->backgroundBscansTarget) {
+			float normFactor = 1.0f / static_cast<float>(this->impl->backgroundBscansRecorded);
+			checkOpenClErrors(clSetKernelArg(this->impl->kernelFinalizeBackgroundFrame, 0, sizeof(cl_mem), &this->impl->d_backgroundFrame));
+			checkOpenClErrors(clSetKernelArg(this->impl->kernelFinalizeBackgroundFrame, 1, sizeof(cl_mem), &this->impl->d_backgroundAccumulator));
+			checkOpenClErrors(clSetKernelArg(this->impl->kernelFinalizeBackgroundFrame, 2, sizeof(float), &normFactor));
+			checkOpenClErrors(clSetKernelArg(this->impl->kernelFinalizeBackgroundFrame, 3, sizeof(int), &samplesPerBscan));
+			checkOpenClErrors(clEnqueueNDRangeKernel(queue, this->impl->kernelFinalizeBackgroundFrame, 1, nullptr, &bgGlobalSize, &localWorkSize, 0, nullptr, nullptr));
+
+			//copy recorded frame to host and sync to configuration
+			this->impl->recordedBackgroundFrame.resize(samplesPerBscan);
+			checkOpenClErrors(clEnqueueReadBuffer(queue, this->impl->d_backgroundFrame, CL_TRUE, 0,
+				samplesPerBscan * sizeof(float), this->impl->recordedBackgroundFrame.data(), 0, nullptr, nullptr));
+
+			this->impl->config.setBackgroundFrameProfile(
+				this->impl->recordedBackgroundFrame, signalLength, ascansPerBscan);
+
+			this->impl->backgroundRecordingInProgress = false;
+			this->impl->backgroundFrameValid = true;
+			this->impl->smoothedFrameDirty = true;
+		}
+	}
+
+	//	Continuous EMA update: folds ALL B-scans of this buffer into the background first,
+	//	the FINAL background is then subtracted from the entire buffer
+	if (backgroundContinuous) {
+		if (!this->impl->backgroundFrameValid) {
+			//	EMA bootstraps from a zeroed background and converges over ~bscansToAverage B-scans
+			float zero = 0.0f;
+			checkOpenClErrors(clEnqueueFillBuffer(queue, this->impl->d_backgroundFrame,
+				&zero, sizeof(float), 0, samplesPerBscan * sizeof(float), 0, nullptr, nullptr));
+			this->impl->backgroundFrameValid = true;
+		}
+		float alpha = 1.0f / static_cast<float>(bfParams.bscansToAverage);
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelUpdateBackgroundFrameEMA, 0, sizeof(cl_mem), &this->impl->d_backgroundFrame));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelUpdateBackgroundFrameEMA, 1, sizeof(cl_mem), &d_fftBuffer));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelUpdateBackgroundFrameEMA, 2, sizeof(float), &alpha));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelUpdateBackgroundFrameEMA, 3, sizeof(int), &samplesPerBscan));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelUpdateBackgroundFrameEMA, 4, sizeof(int), &bscansPerBuffer));
+		checkOpenClErrors(clEnqueueNDRangeKernel(queue, this->impl->kernelUpdateBackgroundFrameEMA, 1, nullptr, &bgGlobalSize, &localWorkSize, 0, nullptr, nullptr));
+		this->impl->smoothedFrameDirty = true;
+	}
+
+	//	Background frame subtraction (in place on d_fftBuffer)
+	if (bfParams.enabled && this->impl->backgroundFrameValid) {
+		cl_mem d_activeFrame = this->impl->d_backgroundFrame;
+		if (bfParams.smoothSpectra) {
+			if (backgroundWritersActive) {
+				//	Writer regime: rebuild in-queue inside the serialized stage
+				int windowRadius = bfParams.smoothingWindowRadius;
+				checkOpenClErrors(clSetKernelArg(this->impl->kernelSmoothBackgroundSpectra, 0, sizeof(cl_mem), &this->impl->d_backgroundSmoothedFrame));
+				checkOpenClErrors(clSetKernelArg(this->impl->kernelSmoothBackgroundSpectra, 1, sizeof(cl_mem), &this->impl->d_backgroundFrame));
+				checkOpenClErrors(clSetKernelArg(this->impl->kernelSmoothBackgroundSpectra, 2, sizeof(int), &windowRadius));
+				checkOpenClErrors(clSetKernelArg(this->impl->kernelSmoothBackgroundSpectra, 3, sizeof(int), &signalLength));
+				checkOpenClErrors(clSetKernelArg(this->impl->kernelSmoothBackgroundSpectra, 4, sizeof(int), &samplesPerBscan));
+				checkOpenClErrors(clEnqueueNDRangeKernel(queue, this->impl->kernelSmoothBackgroundSpectra, 1, nullptr, &bgGlobalSize, &localWorkSize, 0, nullptr, nullptr));
+				this->impl->smoothedFrameDirty = false;
+				d_activeFrame = this->impl->d_backgroundSmoothedFrame;
+			} else if (!this->impl->smoothedFrameDirty) {
+				//	Static regime: the cached copy was rebuilt at the last transition
+				d_activeFrame = this->impl->d_backgroundSmoothedFrame;
+			}
+			//	else: stale cache in static regime (should not happen, transitions rebuild it);
+			//	fall back to the unsmoothed frame rather than reading a stale buffer
+		}
+		if (bfParams.normalize) {
+			checkOpenClErrors(clSetKernelArg(this->impl->kernelBackgroundFrameSubtractionAndNormalization, 0, sizeof(cl_mem), &d_fftBuffer));
+			checkOpenClErrors(clSetKernelArg(this->impl->kernelBackgroundFrameSubtractionAndNormalization, 1, sizeof(cl_mem), &d_activeFrame));
+			checkOpenClErrors(clSetKernelArg(this->impl->kernelBackgroundFrameSubtractionAndNormalization, 2, sizeof(int), &samplesPerBscan));
+			checkOpenClErrors(clSetKernelArg(this->impl->kernelBackgroundFrameSubtractionAndNormalization, 3, sizeof(int), &samplesPerBuffer));
+			checkOpenClErrors(clSetKernelArg(this->impl->kernelBackgroundFrameSubtractionAndNormalization, 4, sizeof(float), &frameNormalizationScale));
+			checkOpenClErrors(clEnqueueNDRangeKernel(queue, this->impl->kernelBackgroundFrameSubtractionAndNormalization, 1, nullptr, &globalWorkSize, &localWorkSize, 0, nullptr, nullptr));
+		} else {
+			checkOpenClErrors(clSetKernelArg(this->impl->kernelBackgroundFrameSubtractionOnly, 0, sizeof(cl_mem), &d_fftBuffer));
+			checkOpenClErrors(clSetKernelArg(this->impl->kernelBackgroundFrameSubtractionOnly, 1, sizeof(cl_mem), &d_activeFrame));
+			checkOpenClErrors(clSetKernelArg(this->impl->kernelBackgroundFrameSubtractionOnly, 2, sizeof(int), &samplesPerBscan));
+			checkOpenClErrors(clSetKernelArg(this->impl->kernelBackgroundFrameSubtractionOnly, 3, sizeof(int), &samplesPerBuffer));
+			checkOpenClErrors(clEnqueueNDRangeKernel(queue, this->impl->kernelBackgroundFrameSubtractionOnly, 1, nullptr, &globalWorkSize, &localWorkSize, 0, nullptr, nullptr));
+		}
+	}
+
+	if (backgroundWritersActive) {
+		//	Record the ordering event and flush this queue: a cross-queue event dependency
+		//	only makes progress once its producer queue's work has been submitted
+		cl_event stageEvent = nullptr;
+		checkOpenClErrors(clEnqueueMarkerWithWaitList(queue, 0, nullptr, &stageEvent));
+		checkOpenClErrors(clFlush(queue));
+		if (this->impl->backgroundStageDone) {
+			clReleaseEvent(this->impl->backgroundStageDone);
+		}
+		this->impl->backgroundStageDone = stageEvent;
+	}
+
 	//	Step 2: Rolling average background removal
 	if (config.processingParams.dcRemoval.enabled) {
 		int windowSize = config.processingParams.dcRemoval.windowSize;
@@ -1261,6 +1510,17 @@ void OpenClBackend::process(IOBuffer& input) {
 #else
 	checkVkFFTErrors(VkFFTAppend(&this->impl->fftApp, 1, &launchParams));
 #endif
+
+	//	Step 4.5: Post-FFT frame correction: divide each A-scan by the square root of its
+	//	pre-subtraction spectral average (computed in step 1.5 into per-queue scratch)
+	if (frameCorrection) {
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelNormalizeAscansBySqrtSpectralAverages, 0, sizeof(cl_mem), &d_fftBuffer2));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelNormalizeAscansBySqrtSpectralAverages, 1, sizeof(cl_mem), &this->impl->d_liveSpectralAverages[queueIndex]));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelNormalizeAscansBySqrtSpectralAverages, 2, sizeof(float), &frameNormalizationScale));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelNormalizeAscansBySqrtSpectralAverages, 3, sizeof(int), &signalLength));
+		checkOpenClErrors(clSetKernelArg(this->impl->kernelNormalizeAscansBySqrtSpectralAverages, 4, sizeof(int), &samplesPerBuffer));
+		checkOpenClErrors(clEnqueueNDRangeKernel(queue, this->impl->kernelNormalizeAscansBySqrtSpectralAverages, 1, nullptr, &globalWorkSize, &localWorkSize, 0, nullptr, nullptr));
+	}
 
 	//	Step 5: Fixed-pattern noise removal
 	if (config.processingParams.fixedPatternNoise.enabled) {
@@ -1516,7 +1776,31 @@ void OpenClBackend::process(IOBuffer& input) {
 
 
 void OpenClBackend::updateConfig(const ProcessorConfiguration& config) {
+	//	Background frame transitions (enable/continuous/smoothing changes) modify shared
+	//	device state; drain the processing queues once so no in-flight buffer observes
+	//	a partially applied regime, then rebuild the smoothed frame under the new settings
+	const ProcessorConfiguration::ProcessingParameters::BackgroundFrame& oldBf =
+		this->impl->config.processingParams.backgroundFrame;
+	const ProcessorConfiguration::ProcessingParameters::BackgroundFrame& newBf =
+		config.processingParams.backgroundFrame;
+	bool backgroundTransition = this->impl->openclInitialized &&
+		(oldBf.enabled != newBf.enabled ||
+		 oldBf.continuousUpdate != newBf.continuousUpdate ||
+		 oldBf.smoothSpectra != newBf.smoothSpectra ||
+		 oldBf.smoothingWindowRadius != newBf.smoothingWindowRadius);
+
+	if (backgroundTransition) {
+		this->drainProcessingQueues();
+		if (oldBf.smoothingWindowRadius != newBf.smoothingWindowRadius) {
+			this->impl->smoothedFrameDirty = true;
+		}
+	}
+
 	this->impl->config = config;
+
+	if (backgroundTransition) {
+		this->rebuildSmoothedBackgroundFrame();
+	}
 }
 
 void OpenClBackend::updateResamplingCurve(const float* curve, size_t length) {
@@ -1628,25 +1912,136 @@ const std::vector<float>& OpenClBackend::getFixedPatternNoiseProfile() const {
 	return this->impl->recordedFixedPatternNoise;
 }
 
+// ============================================
+// Background Frame Methods (Line-Field OCT)
+// ============================================
+
+void OpenClBackend::drainProcessingQueues() {
+	for (cl_command_queue queue : this->impl->commandQueues) {
+		if (queue) {
+			checkOpenClErrors(clFinish(queue));
+		}
+	}
+}
+
+void OpenClBackend::rebuildSmoothedBackgroundFrame() {
+	//	Must only be called with no processing in flight (after initialize() or a drain).
+	//	In continuous mode the smoothed frame is instead rebuilt in-queue inside the
+	//	event-serialized background stage of process()
+	if (!this->impl->config.processingParams.backgroundFrame.smoothSpectra ||
+		!this->impl->backgroundFrameValid ||
+		!this->impl->smoothedFrameDirty) {
+		return;
+	}
+
+	int samplesPerBscan = this->impl->signalLength * this->impl->ascansPerBscan;
+	int windowRadius = this->impl->config.processingParams.backgroundFrame.smoothingWindowRadius;
+	size_t localSize = this->impl->workGroupSize;
+	size_t globalSize = samplesPerBscan;
+	if (globalSize % localSize != 0) {
+		globalSize = ((globalSize + localSize - 1) / localSize) * localSize;
+	}
+	checkOpenClErrors(clSetKernelArg(this->impl->kernelSmoothBackgroundSpectra, 0, sizeof(cl_mem), &this->impl->d_backgroundSmoothedFrame));
+	checkOpenClErrors(clSetKernelArg(this->impl->kernelSmoothBackgroundSpectra, 1, sizeof(cl_mem), &this->impl->d_backgroundFrame));
+	checkOpenClErrors(clSetKernelArg(this->impl->kernelSmoothBackgroundSpectra, 2, sizeof(int), &windowRadius));
+	checkOpenClErrors(clSetKernelArg(this->impl->kernelSmoothBackgroundSpectra, 3, sizeof(int), &this->impl->signalLength));
+	checkOpenClErrors(clSetKernelArg(this->impl->kernelSmoothBackgroundSpectra, 4, sizeof(int), &samplesPerBscan));
+	checkOpenClErrors(clEnqueueNDRangeKernel(this->impl->commandQueues[0], this->impl->kernelSmoothBackgroundSpectra, 1, nullptr, &globalSize, &localSize, 0, nullptr, nullptr));
+	checkOpenClErrors(clFinish(this->impl->commandQueues[0]));
+	this->impl->smoothedFrameDirty = false;
+}
+
 void OpenClBackend::requestBackgroundFrameRecording() {
-	throw std::runtime_error("Background frame recording is not yet supported on the OpenCL backend");
+	if (!this->impl->openclInitialized) {
+		throw std::runtime_error("OpenCL backend not initialized");
+	}
+
+	//	Drain so no in-flight buffer contributes to the fresh accumulator
+	this->drainProcessingQueues();
+
+	size_t samplesPerBscanSize = static_cast<size_t>(this->impl->signalLength) * this->impl->ascansPerBscan * sizeof(float);
+	float zero = 0.0f;
+	checkOpenClErrors(clEnqueueFillBuffer(this->impl->commandQueues[0], this->impl->d_backgroundAccumulator,
+		&zero, sizeof(float), 0, samplesPerBscanSize, 0, nullptr, nullptr));
+	checkOpenClErrors(clFinish(this->impl->commandQueues[0]));
+	this->impl->backgroundBscansRecorded = 0;
+	this->impl->backgroundBscansTarget = this->impl->config.processingParams.backgroundFrame.bscansToAverage;
+	this->impl->backgroundRecordingInProgress = true;
 }
 
 void OpenClBackend::setBackgroundFrameProfile(const float* frame, size_t samplesPerLine, size_t ascansPerBscan) {
-	// Stored host-side only so configuration save/load and backend switching preserve the profile
-	this->backgroundFrameProfile.assign(frame, frame + samplesPerLine * ascansPerBscan);
+	if (!frame || samplesPerLine == 0 || ascansPerBscan == 0) {
+		throw std::invalid_argument("Invalid background frame profile pointer");
+	}
+	if (samplesPerLine != static_cast<size_t>(this->impl->signalLength) ||
+		ascansPerBscan != static_cast<size_t>(this->impl->ascansPerBscan)) {
+		throw std::invalid_argument("Background frame profile dimensions do not match current configuration");
+	}
+
+	//	Drain so no in-flight buffer reads the frame while it is replaced
+	this->drainProcessingQueues();
+
+	size_t samplesPerBscan = samplesPerLine * ascansPerBscan;
+	checkOpenClErrors(clEnqueueWriteBuffer(this->impl->commandQueues[0], this->impl->d_backgroundFrame, CL_TRUE, 0,
+		samplesPerBscan * sizeof(float), frame, 0, nullptr, nullptr));
+
+	//	Update host copy
+	this->impl->recordedBackgroundFrame.assign(frame, frame + samplesPerBscan);
+	this->impl->backgroundFrameValid = true;
+	this->impl->smoothedFrameDirty = true;
+	this->rebuildSmoothedBackgroundFrame();
 }
 
 std::vector<float> OpenClBackend::getBackgroundFrameProfile() const {
-	return this->backgroundFrameProfile;
+	if (!this->impl->backgroundFrameValid) {
+		return {};
+	}
+	if (!this->impl->openclInitialized) {
+		return this->impl->recordedBackgroundFrame;
+	}
+
+	//	Snapshot the live device frame: during continuous EMA update the host mirror is
+	//	stale, and this readback is only performed on explicit get/save/backend-transfer
+	//	requests - never in the per-buffer hot path
+	const_cast<OpenClBackend*>(this)->drainProcessingQueues();
+
+	int samplesPerBscan = this->impl->signalLength * this->impl->ascansPerBscan;
+	std::vector<float> snapshot(samplesPerBscan);
+	checkOpenClErrors(clEnqueueReadBuffer(this->impl->commandQueues[0], this->impl->d_backgroundFrame, CL_TRUE, 0,
+		samplesPerBscan * sizeof(float), snapshot.data(), 0, nullptr, nullptr));
+	return snapshot;
 }
 
 bool OpenClBackend::hasBackgroundFrameProfile() const {
-	return !this->backgroundFrameProfile.empty();
+	return this->impl->backgroundFrameValid;
 }
 
 void OpenClBackend::resetBackgroundFrame() {
-	this->backgroundFrameProfile.clear();
+	if (!this->impl->openclInitialized) {
+		this->impl->recordedBackgroundFrame.clear();
+		this->impl->backgroundFrameValid = false;
+		this->impl->backgroundRecordingInProgress = false;
+		this->impl->backgroundBscansRecorded = 0;
+		this->impl->backgroundBscansTarget = 0;
+		return;
+	}
+
+	//	Drain so no in-flight buffer reads the frame while it is cleared
+	this->drainProcessingQueues();
+
+	size_t samplesPerBscanSize = static_cast<size_t>(this->impl->signalLength) * this->impl->ascansPerBscan * sizeof(float);
+	float zero = 0.0f;
+	checkOpenClErrors(clEnqueueFillBuffer(this->impl->commandQueues[0], this->impl->d_backgroundFrame,
+		&zero, sizeof(float), 0, samplesPerBscanSize, 0, nullptr, nullptr));
+	checkOpenClErrors(clEnqueueFillBuffer(this->impl->commandQueues[0], this->impl->d_backgroundAccumulator,
+		&zero, sizeof(float), 0, samplesPerBscanSize, 0, nullptr, nullptr));
+	checkOpenClErrors(clFinish(this->impl->commandQueues[0]));
+	this->impl->recordedBackgroundFrame.clear();
+	this->impl->backgroundFrameValid = false;
+	this->impl->backgroundRecordingInProgress = false;
+	this->impl->backgroundBscansRecorded = 0;
+	this->impl->backgroundBscansTarget = 0;
+	this->impl->smoothedFrameDirty = true;
 }
 
 void CL_CALLBACK OpenClBackend::returnBufferCallback(cl_event event, cl_int status, void* userData) {

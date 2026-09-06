@@ -156,6 +156,12 @@ int main() {
 			std::cout << "  [SKIPPED] CUDA suite: no CUDA device available" << std::endl;
 		}
 
+		if (ope::BackendUtils::isOpenCLAvailable()) {
+			runBackendSuite(ope::Backend::OPENCL, "OpenCL");
+		} else {
+			std::cout << "  [SKIPPED] OpenCL suite: no OpenCL runtime available" << std::endl;
+		}
+
 		std::cout << "\nAll frame correction tests passed" << std::endl;
 		return 0;
 	} catch (const std::exception& e) {

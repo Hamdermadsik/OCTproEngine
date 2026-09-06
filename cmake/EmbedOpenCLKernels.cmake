@@ -1,27 +1,37 @@
 #	Read the OpenCL kernel source file and split to avoid MSVC string length limit
-#	Split at line 370 (before Dispersion Compensation section)
+#	Split into three parts at lines 320 and 640
 
 cmake_policy(SET CMP0007 NEW)
 
 file(STRINGS ${INPUT_FILE} KERNEL_LINES)
 list(LENGTH KERNEL_LINES LINE_COUNT)
 
-#	First part: lines 0-369 (370 lines)
+#	First part: lines 0-319
 set(PART1 "")
 set(LINE_NUM 0)
 foreach(line IN LISTS KERNEL_LINES)
-	if(LINE_NUM LESS 370)
+	if(LINE_NUM LESS 320)
 		string(APPEND PART1 "${line}\n")
 	endif()
 	math(EXPR LINE_NUM "${LINE_NUM} + 1")
 endforeach()
 
-#	Second part: lines 370+
+#	Second part: lines 320-639
 set(PART2 "")
 set(LINE_NUM 0)
 foreach(line IN LISTS KERNEL_LINES)
-	if(NOT LINE_NUM LESS 370)
+	if(NOT LINE_NUM LESS 320 AND LINE_NUM LESS 640)
 		string(APPEND PART2 "${line}\n")
+	endif()
+	math(EXPR LINE_NUM "${LINE_NUM} + 1")
+endforeach()
+
+#	Third part: lines 640+
+set(PART3 "")
+set(LINE_NUM 0)
+foreach(line IN LISTS KERNEL_LINES)
+	if(NOT LINE_NUM LESS 640)
+		string(APPEND PART3 "${line}\n")
 	endif()
 	math(EXPR LINE_NUM "${LINE_NUM} + 1")
 endforeach()
@@ -67,13 +77,22 @@ const char* KERNEL_FILL_SINUSOIDAL_SCAN_CURVE = \"fillSinusoidalScanCorrectionCu
 const char* KERNEL_SINUSOIDAL_SCAN_CORRECTION = \"sinusoidalScanCorrection\";
 const char* KERNEL_GET_POST_PROCESS_BACKGROUND = \"getPostProcessBackground\";
 const char* KERNEL_POST_PROCESS_BACKGROUND_SUBTRACTION = \"postProcessBackgroundSubtraction\";
+const char* KERNEL_BACKGROUND_FRAME_SUBTRACTION_ONLY = \"backgroundFrameSubtractionOnly\";
+const char* KERNEL_BACKGROUND_FRAME_SUBTRACTION_AND_NORMALIZATION = \"backgroundFrameSubtractionAndNormalization\";
+const char* KERNEL_SMOOTH_BACKGROUND_SPECTRA = \"smoothBackgroundSpectra\";
+const char* KERNEL_ACCUMULATE_BACKGROUND_FRAME = \"accumulateBackgroundFrame\";
+const char* KERNEL_FINALIZE_BACKGROUND_FRAME = \"finalizeBackgroundFrame\";
+const char* KERNEL_UPDATE_BACKGROUND_FRAME_EMA = \"updateBackgroundFrameEMA\";
+const char* KERNEL_AVERAGE_LIVE_SPECTRA = \"averageLiveSpectra\";
+const char* KERNEL_NORMALIZE_ASCANS_BY_SQRT_SPECTRAL_AVERAGES = \"normalizeAscansBySqrtSpectralAverages\";
 
 // OpenCL kernel source embedded as raw string literal
 // Split into parts to avoid MSVC string length limit
 const char* getKernelSource() {
 	static std::string kernelSource =
-		R\"OPENCL_KERNELS(${PART1})OPENCL_KERNELS\"
-		R\"OPENCL_KERNELS(${PART2})OPENCL_KERNELS\";
+		std::string(R\"OPENCL_KERNELS(${PART1})OPENCL_KERNELS\") +
+		R\"OPENCL_KERNELS(${PART2})OPENCL_KERNELS\" +
+		R\"OPENCL_KERNELS(${PART3})OPENCL_KERNELS\";
 	return kernelSource.c_str();
 }
 
