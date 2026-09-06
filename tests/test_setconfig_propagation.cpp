@@ -80,10 +80,63 @@ void testSetConfigPropagatesProcessingFlags() {
 	std::cout << "  [OK] logScale change via setConfig() reached the backend" << std::endl;
 }
 
+// Changing only the input data type must reallocate the backend buffers: the caller
+// must receive a buffer of the new size from getNextAvailableInputBuffer(), and the
+// output must match a processor that was built with the new type from the start
+void testDataTypeChangeReinitializes() {
+	std::cout << "Testing data type change reinitializes backend buffers..." << std::endl;
+
+	const int signalLength = 1024;
+	const int ascansPerBscan = 16;
+	const int bscansPerBuffer = 1;
+	const int samplesPerBuffer = signalLength * ascansPerBscan * bscansPerBuffer;
+	const int outputSamples = samplesPerBuffer / 2;
+
+	std::vector<uint16_t> inputData(samplesPerBuffer);
+	for (int i = 0; i < samplesPerBuffer; i++) {
+		inputData[i] = static_cast<uint16_t>(2000 + 900 * std::sin(i * 0.07));
+	}
+
+	// Reference: built as UINT16 from the start
+	ope::Processor reference(ope::Backend::CPU);
+	reference.setInputParameters(signalLength, ascansPerBscan, bscansPerBuffer, ope::DataType::UINT16);
+	reference.initialize();
+	std::vector<float> referenceOutput = processOneBuffer(reference, inputData, outputSamples);
+
+	// Path 1: type change via bulk setConfig() on an initialized processor
+	ope::Processor viaSetConfig(ope::Backend::CPU);
+	viaSetConfig.setInputParameters(signalLength, ascansPerBscan, bscansPerBuffer, ope::DataType::UINT8);
+	viaSetConfig.initialize();
+	ope::ProcessorConfiguration config = viaSetConfig.getConfig();
+	config.dataParams.inputDataType = ope::DataType::UINT16;
+	viaSetConfig.setConfig(config);
+	TEST_ASSERT(viaSetConfig.getNextAvailableInputBuffer().getSizeInBytes() ==
+		static_cast<size_t>(samplesPerBuffer) * sizeof(uint16_t),
+		"setConfig() type change must reallocate input buffers before hand-out");
+	std::vector<float> output1 = processOneBuffer(viaSetConfig, inputData, outputSamples);
+
+	// Path 2: type change via setInputParameters() followed directly by buffer acquisition
+	ope::Processor viaSetParams(ope::Backend::CPU);
+	viaSetParams.setInputParameters(signalLength, ascansPerBscan, bscansPerBuffer, ope::DataType::UINT8);
+	viaSetParams.initialize();
+	viaSetParams.setInputParameters(signalLength, ascansPerBscan, bscansPerBuffer, ope::DataType::UINT16);
+	TEST_ASSERT(viaSetParams.getNextAvailableInputBuffer().getSizeInBytes() ==
+		static_cast<size_t>(samplesPerBuffer) * sizeof(uint16_t),
+		"setInputParameters() type change must reallocate input buffers before hand-out");
+	std::vector<float> output2 = processOneBuffer(viaSetParams, inputData, outputSamples);
+
+	for (int i = 0; i < outputSamples; i++) {
+		TEST_ASSERT(output1[i] == referenceOutput[i], "setConfig() type change output must match fresh processor");
+		TEST_ASSERT(output2[i] == referenceOutput[i], "setInputParameters() type change output must match fresh processor");
+	}
+	std::cout << "  [OK] data type changes reallocate buffers on both paths" << std::endl;
+}
+
 int main() {
 	std::cout << "=== setConfig() Propagation Test ===" << std::endl;
 	try {
 		testSetConfigPropagatesProcessingFlags();
+		testDataTypeChangeReinitializes();
 		return 0;
 	} catch (const std::exception& e) {
 		std::cerr << "Test failed: " << e.what() << std::endl;

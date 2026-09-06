@@ -407,14 +407,21 @@ public:
 		}
 	}
 	
-	bool needsReinit() const {
-		const auto& current = this->config.dataParams;
-		const auto& last = this->lastInitializedDataParams;
-
+	// Single criteria for "backend buffers must be reallocated" - used by needsReinit()
+	// and setConfig() so both paths react consistently. Data type changes matter too:
+	// buffers are sized in bytes, so a UINT8 -> UINT16 switch invalidates them
+	static bool dataParamsRequireReinit(const ProcessorConfiguration::DataParameters& current,
+	                                    const ProcessorConfiguration::DataParameters& last) {
 		return current.signalLength != last.signalLength ||
 		       current.samplesPerBuffer() != last.samplesPerBuffer() ||
 		       current.ascansPerBscan != last.ascansPerBscan ||
-		       current.bscansPerBuffer != last.bscansPerBuffer;
+		       current.bscansPerBuffer != last.bscansPerBuffer ||
+		       current.inputDataType != last.inputDataType ||
+		       current.outputDataType != last.outputDataType;
+	}
+
+	bool needsReinit() const {
+		return dataParamsRequireReinit(this->config.dataParams, this->lastInitializedDataParams);
 	}
 
 	// Shared worker machinery for input and output callbacks: each callback is
@@ -575,11 +582,7 @@ void Processor::setConfig(const ProcessorConfiguration& config) {
 	Impl::throwIfUnsupportedLineFieldFeatures(config, this->impl->backendType);
 
 	// Check if buffer dimensions changed
-	bool dimensionsChanged =
-		this->impl->config.dataParams.signalLength != config.dataParams.signalLength ||
-		this->impl->config.dataParams.samplesPerBuffer() != config.dataParams.samplesPerBuffer() ||
-		this->impl->config.dataParams.ascansPerBscan != config.dataParams.ascansPerBscan ||
-		this->impl->config.dataParams.bscansPerBuffer != config.dataParams.bscansPerBuffer;
+	bool dimensionsChanged = Impl::dataParamsRequireReinit(config.dataParams, this->impl->config.dataParams);
 
 	// Copy the entire configuration (including custom curves)
 	this->impl->config = config;
@@ -763,7 +766,10 @@ uint64_t Processor::getNextBufferId() const {
 // ============================================
 
 IOBuffer& Processor::getNextAvailableInputBuffer() {
-	//this->impl->ensureInitialized();
+	// Reinitialize before handing out a buffer: after e.g. a data type change the caller
+	// must receive a buffer of the new size, not fill an old one that process() would
+	// then invalidate through its own ensureInitialized()
+	this->impl->ensureInitialized();
 	IOBuffer& buffer = this->impl->backend->getNextAvailableInputBuffer();
 	// The backend only tracks its own use of the buffer (upload/processing).
 	// Input consumers may still be reading it, so block here until every
