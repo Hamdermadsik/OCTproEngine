@@ -127,6 +127,13 @@ You can use the OCTproViewer app to visually verify the processing and run a bas
 
 ![OCTproViewer](documentation/images/octproviewer_screenshot.png)
 
+## Configuration Files
+
+Processor configurations are saved as INI (`saveConfigurationToFile()`), including all 1D
+custom curves and profiles in `COMPLETE` mode. The background frame calibration (line-field
+OCT) is the exception: it is persisted separately as raw float32 binary via
+`saveBackgroundFrameProfileToFile()` / `loadBackgroundFrameProfileFromFile()`.
+
 ## Quick Start - C++
 
 ```cpp

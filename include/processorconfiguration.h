@@ -205,6 +205,9 @@ public:
 		PARAMETERS_ONLY,     // Save only parameters to INI
 		COMPLETE            // Save parameters + custom data in INI
 	};
+	// Note: the background frame profile is never embedded in the INI (COMPLETE covers the
+	// 1D curves/profiles only). Frames are persisted separately as raw float32 binary via
+	// saveBackgroundFrameProfileToFile() / loadBackgroundFrameProfileFromFile()
 
 	bool saveToFile(const std::string& filepath, SaveMode mode = SaveMode::COMPLETE) const;
 	bool loadFromFile(const std::string& filepath, LoadMode mode = LoadMode::OVERWRITE_ALL);

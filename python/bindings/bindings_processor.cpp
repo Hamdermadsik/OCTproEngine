@@ -21,6 +21,8 @@ void register_processor(py::module& m) {
 				"    filepath: Path to configuration file")
 			.def("save_config", &ProcessorWrapper::save_config, py::arg("filepath"),
 				"Save current configuration to INI file\n\n"
+				"Note: the background frame profile is not embedded in the INI; persist it\n"
+				"separately with save_background_frame_profile_to_file() (raw float32)\n\n"
 				"Args:\n"
 				"    filepath: Path to save configuration")
 			.def_property_readonly("config", 

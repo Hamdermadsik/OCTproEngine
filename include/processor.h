@@ -55,6 +55,10 @@ public:
 	bool isInitialized() const;
 
 	// todo: implement load/save ini files (load should be backwards compatible with OCTproZ settings.ini)
+	// Note: background frame calibrations are persisted separately as raw float32 files via
+	// saveBackgroundFrameProfileToFile(); the INI carries the background frame settings only.
+	// A loaded configuration with backgroundFrame.enabled but no frame stays inert until a
+	// frame is recorded, loaded or set
 	void loadConfigurationFromFile(const std::string& filepath);
 	void saveConfigurationToFile(const std::string& filepath) const;
 	
