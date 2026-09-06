@@ -62,6 +62,15 @@ struct ProcessingParams {
 	bool fpnRemoval = false;
 	int fpnBscanCount = 1;
 	bool fpnContinuous = false;
+
+	// Line-field OCT (CPU and CUDA backends only). Continuous EMA update is intentionally
+	// not exposed here: on a looped cached buffer it converges the image to zero
+	bool backgroundFrameSubtraction = false;
+	bool backgroundFrameNormalize = false;
+	int backgroundFrameBscansToAverage = 10;
+	bool backgroundFrameSmoothing = false;
+	int backgroundFrameSmoothingRadius = 16;
+	bool postFftFrameCorrection = false;
 };
 
 struct DataParams {
@@ -212,6 +221,17 @@ void applyProcessingParams(ope::Processor* proc, const ProcessingParams& params)
 	proc->enableFixedPatternNoiseRemoval(params.fpnRemoval);
 	proc->setFixedPatternNoiseBscanCount(params.fpnBscanCount);
 	proc->enableContinuousFixedPatternNoiseDetermination(params.fpnContinuous);
+
+	// Line-field OCT features throw when enabled on unsupported backends
+	bool lineFieldSupported = (proc->getBackend() == ope::Backend::CPU ||
+	                           proc->getBackend() == ope::Backend::CUDA);
+	if (lineFieldSupported) {
+		proc->setBackgroundFrameBscansToAverage(params.backgroundFrameBscansToAverage);
+		proc->setBackgroundFrameSmoothing(params.backgroundFrameSmoothing, params.backgroundFrameSmoothingRadius);
+		proc->enableBackgroundFrameNormalization(params.backgroundFrameNormalize);
+		proc->enableBackgroundFrameSubtraction(params.backgroundFrameSubtraction);
+		proc->enablePostFftFrameCorrection(params.postFftFrameCorrection);
+	}
 }
 
 void initializeProcessor(AppState* state) {
@@ -658,6 +678,54 @@ void renderProcessingUI(AppState* state) {
 			state->processor->requestFixedPatternNoiseDetermination();
 			reprocessData(state);
 		}
+	}
+
+	// Background Frame Subtraction (line-field OCT)
+	ImGui::SeparatorText("Background Frame (Line-Field)");
+	bool lineFieldSupported = (state->dataParams.backend == ope::Backend::CPU ||
+	                           state->dataParams.backend == ope::Backend::CUDA);
+	if (!lineFieldSupported) {
+		ImGui::TextDisabled("Only supported on CPU and CUDA backends");
+	} else {
+		CheckboxWithReprocess("Enable Frame Subtraction", &pp.backgroundFrameSubtraction, state);
+		CheckboxWithReprocess("Normalize by sqrt(Background)", &pp.backgroundFrameNormalize, state);
+		if (ImGui::InputInt("B-scans to Average", &pp.backgroundFrameBscansToAverage, 1, 1)) {
+			if (pp.backgroundFrameBscansToAverage < 1) pp.backgroundFrameBscansToAverage = 1;
+			if (state->autoUpdate) reprocessData(state);
+		}
+		CheckboxWithReprocess("Smooth Background Spectra", &pp.backgroundFrameSmoothing, state);
+		if (ImGui::InputInt("Smoothing Radius", &pp.backgroundFrameSmoothingRadius, 1, 1)) {
+			if (pp.backgroundFrameSmoothingRadius < 0) pp.backgroundFrameSmoothingRadius = 0;
+			if (state->autoUpdate) reprocessData(state);
+		}
+		if (ImGui::Button("Record Background Frame", ImVec2(-1, 0))) {
+			if (state->processorInitialized && state->hasDataLoaded) {
+				state->processor->requestBackgroundFrameRecording();
+				// Recording averages bscansToAverage B-scans; feed the cached buffer until
+				// the recording completes (recording from the displayed data mostly nulls
+				// the image - it is a correctness check, real use needs line-field data)
+				int buffersNeeded = (pp.backgroundFrameBscansToAverage + state->dataParams.bscansPerBuffer - 1) /
+				                    state->dataParams.bscansPerBuffer;
+				for (int i = 0; i < buffersNeeded; ++i) {
+					reprocessData(state);
+				}
+			}
+		}
+		if (ImGui::Button("Reset Background Frame", ImVec2(-1, 0))) {
+			if (state->processorInitialized) {
+				state->processor->resetBackgroundFrame();
+				if (state->autoUpdate) reprocessData(state);
+			}
+		}
+		if (state->processorInitialized && state->processor->hasBackgroundFrameProfile()) {
+			ImGui::Text("Background frame: available");
+		} else {
+			ImGui::TextDisabled("Background frame: none");
+		}
+
+		// Post-FFT Frame Correction (line-field OCT)
+		ImGui::SeparatorText("Post-FFT Frame Correction (Line-Field)");
+		CheckboxWithReprocess("Enable Frame Correction", &pp.postFftFrameCorrection, state);
 	}
 
 	ImGui::SeparatorText("Misc");
