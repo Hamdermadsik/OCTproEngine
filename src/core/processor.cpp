@@ -54,6 +54,11 @@ public:
 	int numBuffers = 2;           // currently default for all backends. todo: make configurable per backend?
 	std::unique_ptr<BackendConfig> backendConfig;  // Unified backend configuration
 
+	// Stable storage for the raw-pointer profile getters' config fallback: the config
+	// getters return by value, so returning .data() of a temporary would dangle
+	mutable std::vector<float> fpnProfileSnapshot;
+	mutable std::vector<float> postProcBackgroundSnapshot;
+
 	Impl(Backend type) : backendType(type) {
 		// Create default configuration for the backend
 		this->backendConfig = BackendUtils::createDefaultConfig(type);
@@ -787,40 +792,50 @@ void Processor::setBackend(Backend backend) {
 	ProcessorConfiguration transferConfig = this->impl->config;
 	if (this->impl->initialized) {
 		this->impl->syncBackendProfilesToConfig(transferConfig);
-
-		// Clean up old backend
-		this->impl->backend->cleanup();
-		this->impl->initialized = false;
 	}
 
-	// Create new backend
-	this->impl->createBackend(backend);
+	try {
+		if (this->impl->initialized) {
+			// Clean up old backend
+			this->impl->backend->cleanup();
+			this->impl->initialized = false;
+		}
 
-	// If old backend was initialized, initialize new backend with config
-	// The new backend will load any recorded profiles from config during initialization
-	if (wasInitialized) {
-		this->impl->backend->initialize(transferConfig);
+		// Create new backend
+		this->impl->createBackend(backend);
 
-		// Set buffer count from backend before setting callbacks
-		this->impl->outputBufferManager.setBufferCount(this->impl->backend->getOutputBufferCount());
+		// If old backend was initialized, initialize new backend with config
+		// The new backend will load any recorded profiles from config during initialization
+		if (wasInitialized) {
+			this->impl->backend->initialize(transferConfig);
 
-		// Setup release callback for OutputBufferManager
-		this->impl->outputBufferManager.setReleaseCallback([this](IOBuffer* buf) {
-			this->impl->backend->releaseOutputBuffer(buf);
-		});
+			// Set buffer count from backend before setting callbacks
+			this->impl->outputBufferManager.setBufferCount(this->impl->backend->getOutputBufferCount());
 
-		// Setup internal callback that distributes to all consumers via OutputBufferManager
-		this->impl->backend->setOutputCallback([this](const IOBuffer& output) {
-			this->impl->outputBufferManager.publish(const_cast<IOBuffer*>(&output));
-		});
+			// Setup release callback for OutputBufferManager
+			this->impl->outputBufferManager.setReleaseCallback([this](IOBuffer* buf) {
+				this->impl->backend->releaseOutputBuffer(buf);
+			});
 
-		// Setup input buffers for raw data consumers
-		this->impl->inputBufferManager.setBufferCount(this->impl->backend->getNumInputBuffers());
+			// Setup internal callback that distributes to all consumers via OutputBufferManager
+			this->impl->backend->setOutputCallback([this](const IOBuffer& output) {
+				this->impl->outputBufferManager.publish(const_cast<IOBuffer*>(&output));
+			});
 
-		this->impl->initialized = true;
+			// Setup input buffers for raw data consumers
+			this->impl->inputBufferManager.setBufferCount(this->impl->backend->getNumInputBuffers());
 
-		// Send curves to backend
-		this->impl->updateAllBackendCurves();
+			this->impl->initialized = true;
+
+			// Send curves to backend
+			this->impl->updateAllBackendCurves();
+		}
+	} catch (...) {
+		// The old backend - and with it the live calibration - is already gone; store the
+		// transfer snapshot as the new baseline so the captured profiles stay recoverable.
+		// The next successful initialization restores them from the configuration
+		this->impl->config = transferConfig;
+		throw;
 	}
 }
 
@@ -1354,25 +1369,46 @@ void Processor::setFixedPatternNoiseProfile(const float* data, size_t complexPai
 }
 
 const float* Processor::getFixedPatternNoiseProfile() const {
-	// Get from config (single source of truth for recorded profiles)
-	const std::vector<float>& profile = this->impl->config.getFixedPatternNoiseProfile();
-	return profile.empty() ? nullptr : profile.data();
+	// Check backend first if initialized (it has the most recent data, e.g. after recording)
+	if (this->impl->initialized) {
+		const std::vector<float>& profile = this->impl->backend->getFixedPatternNoiseProfile();
+		if (!profile.empty()) {
+			return profile.data();
+		}
+	}
+	// Fall back to config (through stable snapshot storage: the config getter returns
+	// by value, so returning .data() of a temporary would dangle)
+	this->impl->fpnProfileSnapshot = this->impl->config.getFixedPatternNoiseProfile();
+	return this->impl->fpnProfileSnapshot.empty() ? nullptr : this->impl->fpnProfileSnapshot.data();
 }
 
 size_t Processor::getFixedPatternNoiseProfileSize() const {
-	// Get from config (single source of truth for recorded profiles)
+	// Check backend first if initialized (it has the most recent data, e.g. after recording)
 	// Returns complex pairs (vector size / 2)
+	if (this->impl->initialized) {
+		const std::vector<float>& profile = this->impl->backend->getFixedPatternNoiseProfile();
+		if (!profile.empty()) {
+			return profile.size() / 2;
+		}
+	}
 	return this->impl->config.getFixedPatternNoiseProfile().size() / 2;
 }
 
 bool Processor::hasFixedPatternNoiseProfile() const {
-	// Get from config (single source of truth for recorded profiles)
+	// Check backend first if initialized (it has the most recent data, e.g. after recording)
+	if (this->impl->initialized &&
+		!this->impl->backend->getFixedPatternNoiseProfile().empty()) {
+		return true;
+	}
 	return this->impl->config.hasCustomFixedPatternNoiseProfile();
 }
 
 void Processor::saveFixedPatternNoiseProfileToFile(const std::string& filepath) const {
-	// Get from config (single source of truth)
-	const std::vector<float>& profileVec = this->impl->config.getFixedPatternNoiseProfile();
+	// Snapshot the live backend profile first (it may have been recorded since the
+	// configuration was last synced)
+	ProcessorConfiguration snapshot = this->impl->config;
+	this->impl->syncBackendProfilesToConfig(snapshot);
+	const std::vector<float> profileVec = snapshot.getFixedPatternNoiseProfile();
 
 	if (profileVec.empty()) {
 		throw std::runtime_error("No fixed pattern noise profile to save");
@@ -1454,9 +1490,10 @@ const float* Processor::getPostProcessBackgroundProfile() const {
 			return profile.data();
 		}
 	}
-	// Fall back to config
-	const std::vector<float>& profile = this->impl->config.getBackgroundProfile();
-	return profile.empty() ? nullptr : profile.data();
+	// Fall back to config (through stable snapshot storage: the config getter returns
+	// by value, so returning .data() of a temporary would dangle)
+	this->impl->postProcBackgroundSnapshot = this->impl->config.getBackgroundProfile();
+	return this->impl->postProcBackgroundSnapshot.empty() ? nullptr : this->impl->postProcBackgroundSnapshot.data();
 }
 
 size_t Processor::getPostProcessBackgroundProfileSize() const {
@@ -1499,7 +1536,11 @@ void Processor::setPostProcessBackgroundProfile(const float* data, size_t size) 
 
 //todo: use csvhelper here!
 void Processor::savePostProcessBackgroundProfileToFile(const std::string& filepath) const {
-	const std::vector<float>& curveVec = this->impl->config.getBackgroundProfile();
+	// Snapshot the live backend profile first (it may have been recorded since the
+	// configuration was last synced)
+	ProcessorConfiguration snapshot = this->impl->config;
+	this->impl->syncBackendProfilesToConfig(snapshot);
+	const std::vector<float> curveVec = snapshot.getBackgroundProfile();
 
 	if (curveVec.empty()) {
 		throw std::runtime_error("No post-process background curve to save");

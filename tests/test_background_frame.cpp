@@ -793,6 +793,83 @@ void testFailedSwitchKeepsAccurateMetadata() {
 	}
 }
 
+// A recorded calibration must survive a failed backend switch: the transfer snapshot
+// becomes the new baseline, stays exportable, and is restored on recovery
+void testFailedSwitchKeepsCalibrationRecoverable() {
+	std::cout << "  Recorded calibration survives a failed backend switch..." << std::endl;
+	if (!ope::BackendUtils::isCudaAvailable()) {
+		std::cout << "    [SKIPPED] no CUDA device available" << std::endl;
+		return;
+	}
+
+	ope::Processor processor(ope::Backend::CPU);
+	configurePassthrough(processor, 1);
+	processor.setBackgroundFrameBscansToAverage(1);
+	processor.initialize();
+
+	// Record a background of 123 (lives only on the backend, not in the stored config)
+	processor.requestBackgroundFrameRecording();
+	processBuffers(processor, {makeConstantBscans({123})}, 1);
+
+	ope::CudaConfig cudaConfig;
+	cudaConfig.deviceId = 999;
+	bool threw = false;
+	try {
+		processor.setBackendConfig(cudaConfig);
+	} catch (const std::exception&) {
+		threw = true;
+	}
+	TEST_ASSERT(threw, "Switching to an invalid CUDA device must throw");
+
+	// The recorded background must remain available and exportable
+	TEST_ASSERT(processor.hasBackgroundFrameProfile(), "Recorded background must survive the failed switch");
+	std::vector<float> profile = processor.getBackgroundFrameProfile();
+	TEST_ASSERT(!profile.empty() && nearlyEqual(profile[0], 123.0f, 0.01f),
+		"Recorded background values must survive the failed switch");
+	const std::string filepath = "test_failed_switch_frame.raw";
+	processor.saveBackgroundFrameProfileToFile(filepath);
+	std::remove(filepath.c_str());
+
+	// Recovery: switch back to CPU and initialize; the calibration must be live again
+	processor.setBackend(ope::Backend::CPU);
+	processor.initialize();
+	profile = processor.getBackgroundFrameProfile();
+	TEST_ASSERT(!profile.empty() && nearlyEqual(profile[0], 123.0f, 0.01f),
+		"Recorded background must be restored after recovering to a working backend");
+}
+
+// Recorded line profiles must remain visible and exportable after a backend switch
+void testRecordedProfilesExportAfterSwitch() {
+	std::cout << "  Recorded line profiles export after a backend switch..." << std::endl;
+	if (!ope::BackendUtils::isCudaAvailable()) {
+		std::cout << "    [SKIPPED] no CUDA device available" << std::endl;
+		return;
+	}
+
+	ope::Processor processor(ope::Backend::CPU);
+	configurePassthrough(processor, 1);
+	processor.enablePostProcessBackgroundSubtraction(true);
+	processor.enableFixedPatternNoiseRemoval(true);
+	processor.initialize();
+	processor.requestPostProcessBackgroundRecording();
+	processor.requestFixedPatternNoiseDetermination();
+	processBuffers(processor, {makeConstantBscans({500})}, 1);
+
+	processor.setBackend(ope::Backend::CUDA);
+
+	TEST_ASSERT(processor.hasFixedPatternNoiseProfile(),
+		"Recorded FPN profile must be visible after the switch");
+	TEST_ASSERT(processor.hasPostProcessBackgroundProfile(),
+		"Recorded post-process background must be visible after the switch");
+
+	const std::string fpnFile = "test_switch_fpn.csv";
+	const std::string bgFile = "test_switch_bg.csv";
+	processor.saveFixedPatternNoiseProfileToFile(fpnFile);
+	processor.savePostProcessBackgroundProfileToFile(bgFile);
+	std::remove(fpnFile.c_str());
+	std::remove(bgFile.c_str());
+}
+
 // CUDA multi-stream determinism: with continuous EMA and mid-run transitions the CUDA
 // output sequence (3 streams by default) must match the strictly serial CPU backend
 void testCudaSequenceMatchesCpu() {
@@ -887,6 +964,8 @@ int main() {
 		testUnsupportedBackendRejection();
 		testResetAndRejectedSwitchConsistency();
 		testFailedSwitchKeepsAccurateMetadata();
+		testFailedSwitchKeepsCalibrationRecoverable();
+		testRecordedProfilesExportAfterSwitch();
 		testCudaSequenceMatchesCpu();
 
 		std::cout << "\nAll background frame tests passed" << std::endl;
