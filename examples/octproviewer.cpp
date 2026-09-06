@@ -246,7 +246,29 @@ void initializeProcessor(AppState* state) {
 			               (state->dataParams.backend == ope::Backend::OPENCL ? "OpenCL" : "Vulkan")))
 			          << " (preserving profiles)..." << std::endl;
 
-			state->processor->setBackend(state->dataParams.backend);
+			// Line-field OCT features are not supported on OpenCL/Vulkan: disable them on the
+			// processor before switching (UI booleans alone do not satisfy setBackend()'s check)
+			bool targetSupportsLineField = (state->dataParams.backend == ope::Backend::CPU ||
+			                                state->dataParams.backend == ope::Backend::CUDA);
+			if (!targetSupportsLineField &&
+				(state->procParams.backgroundFrameSubtraction || state->procParams.postFftFrameCorrection)) {
+				std::cout << "Disabling background frame subtraction and frame correction "
+				          << "(not supported on the selected backend)" << std::endl;
+				state->processor->enableBackgroundFrameSubtraction(false);
+				state->processor->enablePostFftFrameCorrection(false);
+				state->procParams.backgroundFrameSubtraction = false;
+				state->procParams.postFftFrameCorrection = false;
+			}
+
+			try {
+				state->processor->setBackend(state->dataParams.backend);
+			} catch (const std::exception& e) {
+				std::cerr << "Backend switch failed: " << e.what() << std::endl;
+				// Refresh viewer state from the engine: the switch may have torn down the
+				// processor, and processing must stay blocked until initialization succeeds
+				state->processorInitialized = state->processor->isInitialized();
+				state->dataParams.backend = state->processor->getBackend();
+			}
 			return;
 		}
 		// If backend is the same but hasChanged is true, other params changed - need to recreate
