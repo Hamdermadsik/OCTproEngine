@@ -122,6 +122,7 @@ struct CudaBackend::Impl {
 	bool backgroundFrameValid = false;
 	bool backgroundRecordingInProgress = false;
 	int backgroundBscansRecorded = 0;
+	int backgroundBscansTarget = 0;              // latched at requestBackgroundFrameRecording()
 	bool smoothedFrameDirty = true;
 	cudaEvent_t backgroundStageDone = nullptr;
 	
@@ -372,6 +373,7 @@ void CudaBackend::initialize(const ProcessorConfiguration& config) {
 	this->impl->backgroundFrameValid = false;
 	this->impl->backgroundRecordingInProgress = false;
 	this->impl->backgroundBscansRecorded = 0;
+	this->impl->backgroundBscansTarget = 0;
 	this->impl->smoothedFrameDirty = true;
 	this->impl->recordedBackgroundFrame.clear();
 
@@ -833,8 +835,11 @@ void CudaBackend::process(IOBuffer& input) {
 			d_liveSpectralAveragesBuf, d_fftBuffer, signalLength, ascansPerBuffer);
 	}
 
-	// Continuous EMA only runs together with subtraction (matches OCTproZ)
-	bool backgroundContinuous = bfParams.continuousUpdate && bfParams.enabled;
+	// Continuous EMA only runs together with subtraction (matches OCTproZ).
+	// Recording takes precedence: EMA is suppressed while a recording is in progress and
+	// resumes on the next buffer, seeded by the freshly recorded frame
+	bool backgroundContinuous = bfParams.continuousUpdate && bfParams.enabled &&
+		!this->impl->backgroundRecordingInProgress;
 	bool backgroundWritersActive = backgroundContinuous || this->impl->backgroundRecordingInProgress;
 	bool backgroundStageActive = backgroundWritersActive ||
 		(bfParams.enabled && this->impl->backgroundFrameValid);
@@ -849,7 +854,9 @@ void CudaBackend::process(IOBuffer& input) {
 	// Background frame recording (accumulates across buffers; a recording that completes
 	// here applies starting with the current buffer)
 	if (this->impl->backgroundRecordingInProgress) {
-		int bscansRemaining = bfParams.bscansToAverage - this->impl->backgroundBscansRecorded;
+		// The target is latched at request time: changing the averaging setting
+		// mid-recording must not corrupt the count or the normalization
+		int bscansRemaining = this->impl->backgroundBscansTarget - this->impl->backgroundBscansRecorded;
 		int bscansToProcess = std::min(bscansPerBuffer, bscansRemaining);
 		int bgBlockSize = 256;
 		int bgGridSize = (samplesPerBscan + bgBlockSize - 1) / bgBlockSize;
@@ -857,7 +864,7 @@ void CudaBackend::process(IOBuffer& input) {
 			this->impl->d_backgroundAccumulator, d_fftBuffer, samplesPerBscan, bscansToProcess);
 		this->impl->backgroundBscansRecorded += bscansToProcess;
 
-		if (this->impl->backgroundBscansRecorded >= bfParams.bscansToAverage) {
+		if (this->impl->backgroundBscansRecorded >= this->impl->backgroundBscansTarget) {
 			float normFactor = 1.0f / static_cast<float>(this->impl->backgroundBscansRecorded);
 			cuda_kernels::finalizeBackgroundFrame<<<bgGridSize, bgBlockSize, 0, stream>>>(
 				this->impl->d_backgroundFrame, this->impl->d_backgroundAccumulator,
@@ -1438,6 +1445,7 @@ void CudaBackend::requestBackgroundFrameRecording() {
 	int samplesPerBscan = this->impl->signalLength * this->impl->ascansPerBscan;
 	checkCudaErrors(cudaMemset(this->impl->d_backgroundAccumulator, 0, sizeof(float) * samplesPerBscan));
 	this->impl->backgroundBscansRecorded = 0;
+	this->impl->backgroundBscansTarget = this->impl->config.processingParams.backgroundFrame.bscansToAverage;
 	this->impl->backgroundRecordingInProgress = true;
 }
 
@@ -1508,6 +1516,7 @@ void CudaBackend::resetBackgroundFrame() {
 		this->impl->backgroundFrameValid = false;
 		this->impl->backgroundRecordingInProgress = false;
 		this->impl->backgroundBscansRecorded = 0;
+		this->impl->backgroundBscansTarget = 0;
 		return;
 	}
 
@@ -1524,6 +1533,7 @@ void CudaBackend::resetBackgroundFrame() {
 	this->impl->backgroundFrameValid = false;
 	this->impl->backgroundRecordingInProgress = false;
 	this->impl->backgroundBscansRecorded = 0;
+	this->impl->backgroundBscansTarget = 0;
 	this->impl->smoothedFrameDirty = true;
 }
 

@@ -85,6 +85,7 @@ struct CpuBackend::Impl {
 	bool smoothedFrameDirty = true;
 	std::vector<float> backgroundFrameAccumulator;
 	int backgroundFrameBscansRecorded = 0;
+	int backgroundFrameBscansTarget = 0;     // latched at requestBackgroundFrameRecording()
 	bool backgroundFrameRecordingInProgress = false;
 
 	// Per-buffer spectral averages for post-FFT frame correction (one value per A-scan)
@@ -499,9 +500,12 @@ void CpuBackend::Impl::prepareBackgroundFrame(const void* inputData) {
 	bool frameCorrection = config.processingParams.frameCorrection.enabled;
 	bool recording = this->backgroundFrameRecordingInProgress;
 	// Continuous EMA only runs together with subtraction (matches OCTproZ); it bootstraps
-	// from a zeroed background and converges over ~bscansToAverage B-scans
+	// from a zeroed background and converges over ~bscansToAverage B-scans.
+	// Recording takes precedence: EMA is suppressed while a recording is in progress and
+	// resumes on the next buffer, seeded by the freshly recorded frame
 	bool continuous = config.processingParams.backgroundFrame.continuousUpdate &&
-	                  config.processingParams.backgroundFrame.enabled;
+	                  config.processingParams.backgroundFrame.enabled &&
+	                  !recording;
 
 	if (frameCorrection || recording || continuous) {
 		if (frameCorrection) {
@@ -513,7 +517,9 @@ void CpuBackend::Impl::prepareBackgroundFrame(const void* inputData) {
 
 		int bscansToRecord = 0;
 		if (recording) {
-			int bscansRemaining = config.processingParams.backgroundFrame.bscansToAverage - this->backgroundFrameBscansRecorded;
+			// The target is latched at request time: changing the averaging setting
+			// mid-recording must not corrupt the count or the normalization
+			int bscansRemaining = this->backgroundFrameBscansTarget - this->backgroundFrameBscansRecorded;
 			bscansToRecord = std::min(bscansPerBuffer, bscansRemaining);
 		}
 		float alpha = 1.0f / static_cast<float>(config.processingParams.backgroundFrame.bscansToAverage);
@@ -553,7 +559,7 @@ void CpuBackend::Impl::prepareBackgroundFrame(const void* inputData) {
 
 		if (recording) {
 			this->backgroundFrameBscansRecorded += bscansToRecord;
-			if (this->backgroundFrameBscansRecorded >= config.processingParams.backgroundFrame.bscansToAverage) {
+			if (this->backgroundFrameBscansRecorded >= this->backgroundFrameBscansTarget) {
 				// Finalize: the recorded frame applies starting with the current buffer
 				float normFactor = 1.0f / static_cast<float>(this->backgroundFrameBscansRecorded);
 				this->backgroundFrame.resize(samplesPerBscan);
@@ -898,6 +904,7 @@ void CpuBackend::requestBackgroundFrameRecording() {
 	                      this->impl->config.dataParams.ascansPerBscan;
 	this->impl->backgroundFrameAccumulator.assign(samplesPerBscan, 0.0f);
 	this->impl->backgroundFrameBscansRecorded = 0;
+	this->impl->backgroundFrameBscansTarget = this->impl->config.processingParams.backgroundFrame.bscansToAverage;
 	this->impl->backgroundFrameRecordingInProgress = true;
 }
 
@@ -931,6 +938,7 @@ void CpuBackend::resetBackgroundFrame() {
 	this->impl->smoothedBackgroundFrame.clear();
 	this->impl->backgroundFrameAccumulator.clear();
 	this->impl->backgroundFrameBscansRecorded = 0;
+	this->impl->backgroundFrameBscansTarget = 0;
 	this->impl->backgroundFrameRecordingInProgress = false;
 	this->impl->smoothedFrameDirty = true;
 }

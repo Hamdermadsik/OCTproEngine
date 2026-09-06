@@ -256,6 +256,61 @@ void testEmaBufferSemantics(ope::Backend backend) {
 		"EMA background must converge with (1-alpha)^k");
 }
 
+// The recording target is latched at request time: shrinking the averaging setting
+// mid-recording must not corrupt the count or the normalization
+void testRecordingTargetLatched(ope::Backend backend) {
+	std::cout << "  Recording target latched at request time..." << std::endl;
+
+	ope::Processor processor(backend);
+	configurePassthrough(processor, 2);
+	processor.setBackgroundFrameBscansToAverage(5);
+	processor.initialize();
+
+	processor.requestBackgroundFrameRecording();
+	processBuffers(processor, {makeConstantBscans({100, 200})}, 2);
+
+	// Shrinking the setting mid-recording must not finalize early
+	processor.setBackgroundFrameBscansToAverage(1);
+	TEST_ASSERT(!processor.hasBackgroundFrameProfile(), "Recording must continue to the latched target of 5");
+
+	processBuffers(processor, {makeConstantBscans({300, 400}), makeConstantBscans({500, 9999})}, 2);
+
+	TEST_ASSERT(processor.hasBackgroundFrameProfile(), "Recording must complete at the latched target");
+	std::vector<float> profile = processor.getBackgroundFrameProfile();
+	for (float value : profile) {
+		TEST_ASSERT(nearlyEqual(value, 300.0f, 0.01f),
+			"Recorded profile must average exactly the 5 B-scans of the latched target (300)");
+	}
+}
+
+// Recording takes precedence over continuous update, identically on all backends:
+// while recording, EMA is suppressed; on the next buffer it resumes seeded by the
+// freshly recorded frame
+void testRecordingSuppressesEma(ope::Backend backend) {
+	std::cout << "  Recording suppresses EMA, which resumes from the recorded frame..." << std::endl;
+
+	ope::Processor processor(backend);
+	configurePassthrough(processor, 2);
+	processor.setBackgroundFrameBscansToAverage(2);  // recording target 2, EMA alpha = 1/2
+	processor.enableBackgroundFrameSubtraction(true);
+	processor.enableContinuousBackgroundFrameUpdate(true);
+	processor.initialize();
+
+	processor.requestBackgroundFrameRecording();
+	processBuffers(processor, {makeConstantBscans({10, 20})}, 2);
+
+	// Recording of B-scans 10, 20 finalizes to exactly 15; EMA must not have run on top
+	std::vector<float> profile = processor.getBackgroundFrameProfile();
+	TEST_ASSERT(nearlyEqual(profile[0], 15.0f, 0.01f),
+		"While recording, EMA must be suppressed (background must be exactly the recorded 15)");
+
+	// Next buffer: EMA resumes seeded by the recorded frame: 15 -> 25 -> 30
+	processBuffers(processor, {makeConstantBscans({35, 35})}, 2);
+	profile = processor.getBackgroundFrameProfile();
+	TEST_ASSERT(nearlyEqual(profile[0], 30.0f, 0.01f),
+		"EMA must resume from the recorded frame on the next buffer");
+}
+
 // Raw profile file round trip and reset
 void testSaveLoadReset(ope::Backend backend) {
 	std::cout << "  Raw profile save/load round trip and reset..." << std::endl;
@@ -551,6 +606,8 @@ void runBackendSuite(ope::Backend backend, const char* name) {
 	testNormalization(backend);
 	testSmoothing(backend);
 	testEmaBufferSemantics(backend);
+	testRecordingTargetLatched(backend);
+	testRecordingSuppressesEma(backend);
 	testSaveLoadReset(backend);
 	testDimensionChangeInvalidatesFrame(backend);
 	testSetConfigProfileHandling(backend);
