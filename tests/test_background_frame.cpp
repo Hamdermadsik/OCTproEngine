@@ -63,7 +63,9 @@ std::vector<std::vector<float>> processBuffers(ope::Processor& processor,
 		processor.process(buffer);
 	}
 
+	auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
 	while (received < static_cast<int>(inputs.size())) {
+		TEST_ASSERT(std::chrono::steady_clock::now() < deadline, "Timed out waiting for output delivery");
 		std::this_thread::sleep_for(std::chrono::milliseconds(1));
 	}
 	processor.removeOutputCallback(callbackId);
@@ -351,6 +353,73 @@ void testSaveLoadReset(ope::Backend backend) {
 	TEST_ASSERT(processor.getBackgroundFrameProfile() == loaded, "Rejected profile must not change state");
 }
 
+// Output delivery must continue after a mid-session reinitialization: the backends'
+// ordered callback delivery restarts at buffer ID 0, so the processor must restart
+// its buffer IDs too
+void testReinitializeKeepsDelivering(ope::Backend backend) {
+	std::cout << "  Output delivery continues after reinitialization..." << std::endl;
+
+	ope::Processor processor(backend);
+	configurePassthrough(processor, 1);
+	processor.initialize();
+
+	std::atomic<int> received{0};
+	processor.addOutputCallback([&](const ope::IOBuffer&) { received++; });
+
+	auto waitFor = [&](int count) {
+		auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+		while (received < count) {
+			TEST_ASSERT(std::chrono::steady_clock::now() < deadline,
+				"Timed out waiting for output delivery after reinitialization");
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		}
+	};
+
+	std::vector<uint16_t> data = makeConstantBscans({100});
+	{
+		auto& buffer = processor.getNextAvailableInputBuffer();
+		memcpy(buffer.getDataPointer(), data.data(), data.size() * sizeof(uint16_t));
+		processor.process(buffer);
+	}
+	waitFor(1);
+
+	// Dimension change triggers a reinitialization mid-session
+	ope::ProcessorConfiguration config = processor.getConfig();
+	config.dataParams.bscansPerBuffer = 2;
+	processor.setConfig(config);
+
+	std::vector<uint16_t> data2 = makeConstantBscans({100, 100});
+	{
+		auto& buffer = processor.getNextAvailableInputBuffer();
+		memcpy(buffer.getDataPointer(), data2.data(), data2.size() * sizeof(uint16_t));
+		processor.process(buffer);
+	}
+	waitFor(2);
+}
+
+// setInputParameters() must preserve geometry-compatible live profiles across its
+// eager reinitialization, like setConfig() does
+void testSetInputParametersPreservesFrame(ope::Backend backend) {
+	std::cout << "  setInputParameters() preserves a compatible live frame..." << std::endl;
+
+	ope::Processor processor(backend);
+	configurePassthrough(processor, 1);
+	processor.setBackgroundFrameBscansToAverage(2);  // alpha = 1/2
+	processor.enableBackgroundFrameSubtraction(true);
+	processor.enableContinuousBackgroundFrameUpdate(true);
+	processor.initialize();
+
+	std::vector<uint16_t> data = makeConstantBscans({100});
+	processBuffers(processor, {data}, 1);  // live background: 0 -> 50
+
+	// Only bscansPerBuffer changes: the frame geometry stays valid
+	processor.setInputParameters(SIGNAL_LENGTH, ASCANS_PER_BSCAN, 2, ope::DataType::UINT16);
+
+	std::vector<float> profile = processor.getBackgroundFrameProfile();
+	TEST_ASSERT(!profile.empty() && nearlyEqual(profile[0], 50.0f, 0.01f),
+		"A bscansPerBuffer-only change must preserve the live background");
+}
+
 // setConfig() profile semantics: an explicitly replaced profile must reach the backend,
 // an unchanged profile must not overwrite a live EMA-advanced calibration, and a
 // bscansPerBuffer-only change must preserve the live frame across reinitialization
@@ -390,10 +459,11 @@ void testSetConfigProfileHandling(ope::Backend backend) {
 		ope::ProcessorConfiguration config = processor.getConfig();
 		config.processingParams.dcRemoval.windowSize = 32;  // unrelated change
 		processor.setConfig(config);
+		processor.setConfig(config);  // applying the SAME object again must not reset it either
 
 		std::vector<float> profile = processor.getBackgroundFrameProfile();
 		TEST_ASSERT(nearlyEqual(profile[0], 75.0f, 0.01f),
-			"An unrelated setConfig() round trip must preserve the live EMA background");
+			"Repeated unrelated setConfig() calls must preserve the live EMA background");
 
 		processBuffers(processor, {data}, 1);  // EMA must continue from 75, not restart
 		profile = processor.getBackgroundFrameProfile();
@@ -576,6 +646,42 @@ void testResetAndRejectedSwitchConsistency() {
 	}
 }
 
+// After a failed switch the stored backend configuration must describe the backend
+// instance that actually exists - not an invented default
+void testFailedSwitchKeepsAccurateMetadata() {
+	std::cout << "  Failed device switch keeps accurate backend metadata..." << std::endl;
+	if (!ope::BackendUtils::isCudaAvailable()) {
+		std::cout << "    [SKIPPED] no CUDA device available" << std::endl;
+		return;
+	}
+
+	ope::Processor processor(ope::Backend::CPU);
+	configurePassthrough(processor, 1);
+	processor.initialize();
+
+	ope::CudaConfig cudaConfig;
+	cudaConfig.deviceId = 999;
+	bool threw = false;
+	try {
+		processor.setBackendConfig(cudaConfig);
+	} catch (const std::exception&) {
+		threw = true;
+	}
+	TEST_ASSERT(threw, "Switching to an invalid CUDA device must throw");
+
+	auto backendConfig = processor.getBackendConfig();
+	TEST_ASSERT(backendConfig != nullptr, "Backend configuration must exist after the failure");
+	if (backendConfig->getBackendType() == ope::Backend::CUDA) {
+		// The CUDA backend instance was created with device 999; the stored configuration
+		// must report that, not an invented default
+		TEST_ASSERT(static_cast<ope::CudaConfig*>(backendConfig.get())->deviceId == 999,
+			"Stored backend configuration must describe the actual instance");
+	} else {
+		TEST_ASSERT(backendConfig->getBackendType() == processor.getBackend(),
+			"Stored backend configuration must match the actual backend");
+	}
+}
+
 // CUDA multi-stream determinism: with continuous EMA and mid-run transitions the CUDA
 // output sequence (3 streams by default) must match the strictly serial CPU backend
 void testCudaSequenceMatchesCpu() {
@@ -645,6 +751,8 @@ void runBackendSuite(ope::Backend backend, const char* name) {
 	testSaveLoadReset(backend);
 	testDimensionChangeInvalidatesFrame(backend);
 	testSetConfigProfileHandling(backend);
+	testReinitializeKeepsDelivering(backend);
+	testSetInputParametersPreservesFrame(backend);
 }
 
 int main() {
@@ -665,6 +773,7 @@ int main() {
 		testBackendSwitchTransfer();
 		testUnsupportedBackendRejection();
 		testResetAndRejectedSwitchConsistency();
+		testFailedSwitchKeepsAccurateMetadata();
 		testCudaSequenceMatchesCpu();
 
 		std::cout << "\nAll background frame tests passed" << std::endl;

@@ -17,6 +17,7 @@
 	do { \
 		cudaError_t err = call; \
 		if (err != cudaSuccess) { \
+			cudaGetLastError(); /* clear the sticky per-thread error so it cannot poison later, unrelated calls */ \
 			std::stringstream ss; \
 			ss << "CUDA error at " << __FILE__ << ":" << __LINE__ << " - " \
 			   << cudaGetErrorString(err); \

@@ -25,12 +25,14 @@ void register_processor(py::module& m) {
 				"separately with save_background_frame_profile_to_file() (raw float32)\n\n"
 				"Args:\n"
 				"    filepath: Path to save configuration")
-			.def_property_readonly("config", 
-				[](ProcessorWrapper& self) -> ope::ProcessorConfiguration& {
-					return const_cast<ope::ProcessorConfiguration&>(self.processor.getConfig());
+			.def_property_readonly("config",
+				[](ProcessorWrapper& self) -> ope::ProcessorConfiguration {
+					// Returned by value: a reference would alias the stored configuration,
+					// so mutations would corrupt the change-detection baseline used by
+					// set_config()
+					return self.processor.getConfig();
 				},
-				py::return_value_policy::reference_internal,
-				"Access to configuration object (read/write)")
+				"Copy of the configuration object; modify it and apply with set_config()")
 			.def("set_config", [](ProcessorWrapper& self, const ope::ProcessorConfiguration& config) {
 				self.processor.setConfig(config);
 			}, py::arg("config"), "Set entire configuration at once")

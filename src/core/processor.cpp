@@ -426,6 +426,10 @@ public:
 		}
 		throwIfUnsupportedLineFieldFeatures(this->config, this->backendType);
 
+		// Restart buffer IDs like initialize() does: the backends' ordered callback
+		// delivery restarts at ID 0 after their initialization
+		this->nextBufferId = 0;
+
 		this->backend->cleanup();
 		this->backend->initialize(this->config);
 
@@ -624,8 +628,11 @@ void Processor::setConfig(const ProcessorConfiguration& config) {
 	}
 	Impl::throwIfUnsupportedLineFieldFeatures(config, this->impl->backendType);
 
-	// Check if buffer dimensions changed
-	bool dimensionsChanged = Impl::dataParamsRequireReinit(config.dataParams, this->impl->config.dataParams);
+	// Check if buffer dimensions changed. Compared against the parameters the backend was
+	// actually initialized with: the incoming configuration may alias the stored one
+	// (e.g. a mutated copy obtained from getConfig() via the Python bindings)
+	bool dimensionsChanged = this->impl->initialized &&
+		Impl::dataParamsRequireReinit(config.dataParams, this->impl->lastInitializedDataParams);
 
 	// A profile that differs from the previous configuration expresses intent to replace it.
 	// An unchanged profile must not overwrite a live (EMA-advanced or freshly recorded)
@@ -637,52 +644,53 @@ void Processor::setConfig(const ProcessorConfiguration& config) {
 	// Copy the entire configuration (including custom curves)
 	this->impl->config = config;
 
-	// Preserve live backend profiles where no explicit replacement takes precedence and
-	// their geometry remains valid under the new configuration (a reinitialization would
-	// otherwise restore stale profiles from the incoming configuration)
-	if (this->impl->initialized) {
-		bool liveFrameCompatible =
-			this->impl->lastInitializedDataParams.signalLength == config.dataParams.signalLength &&
-			this->impl->lastInitializedDataParams.ascansPerBscan == config.dataParams.ascansPerBscan;
-		if (!frameReplaced && liveFrameCompatible) {
-			std::vector<float> liveFrame = this->impl->backend->getBackgroundFrameProfile();
-			if (!liveFrame.empty()) {
-				this->impl->config.setBackgroundFrameProfile(liveFrame,
-					config.dataParams.signalLength, config.dataParams.ascansPerBscan);
-			}
-		}
-
-		bool liveLinesCompatible =
-			this->impl->lastInitializedDataParams.signalLength == config.dataParams.signalLength;
-		if (!fpnReplaced && liveLinesCompatible) {
-			const std::vector<float>& liveFpn = this->impl->backend->getFixedPatternNoiseProfile();
-			if (!liveFpn.empty()) {
-				this->impl->config.setFixedPatternNoiseProfile(liveFpn);
-			}
-		}
-		if (!postProcBackgroundReplaced && liveLinesCompatible) {
-			const std::vector<float>& liveBg = this->impl->backend->getPostProcessBackgroundProfile();
-			if (!liveBg.empty()) {
-				this->impl->config.setBackgroundProfile(liveBg);
-			}
-		}
-	}
-
-	// Automatically adjust all custom curves to match the new dimensions
-	// This ensures curves are always the correct size without user intervention
-	this->impl->config.adjustAllCustomCurves();
-
 	// If initialized, handle backend updates
 	if (this->impl->initialized) {
 		if (dimensionsChanged) {
+			// Preserve live backend profiles across the reinitialization where no explicit
+			// replacement takes precedence and their geometry remains valid under the new
+			// configuration (reinitialize() restores the profiles from the configuration).
+			// Deliberately NOT done on the unchanged-dimensions path: there the live
+			// profiles simply stay on the backend, and the stored configuration must keep
+			// serving as the comparison baseline for the next setConfig() call
+			bool liveLinesCompatible =
+				this->impl->lastInitializedDataParams.signalLength == config.dataParams.signalLength;
+			if (!frameReplaced && this->impl->backendFrameGeometryCurrent()) {
+				std::vector<float> liveFrame = this->impl->backend->getBackgroundFrameProfile();
+				if (!liveFrame.empty()) {
+					this->impl->config.setBackgroundFrameProfile(liveFrame,
+						config.dataParams.signalLength, config.dataParams.ascansPerBscan);
+				}
+			}
+			if (!fpnReplaced && liveLinesCompatible) {
+				const std::vector<float>& liveFpn = this->impl->backend->getFixedPatternNoiseProfile();
+				if (!liveFpn.empty()) {
+					this->impl->config.setFixedPatternNoiseProfile(liveFpn);
+				}
+			}
+			if (!postProcBackgroundReplaced && liveLinesCompatible) {
+				const std::vector<float>& liveBg = this->impl->backend->getPostProcessBackgroundProfile();
+				if (!liveBg.empty()) {
+					this->impl->config.setBackgroundProfile(liveBg);
+				}
+			}
+
+			// Automatically adjust all custom curves to match the new dimensions
+			// This ensures curves are always the correct size without user intervention
+			this->impl->config.adjustAllCustomCurves();
+
 			// Dimensions changed - must reinitialize backend
 			this->impl->reinitialize();
 		} else {
 			// Dimensions same - just update curves and parameters
+			this->impl->config.adjustAllCustomCurves();
 			this->impl->backend->updateConfig(this->impl->config);
 			this->impl->updateAllBackendCurves();
 			this->impl->updateBackendProfilesFromConfig(frameReplaced, fpnReplaced, postProcBackgroundReplaced);
 		}
+	} else {
+		// Automatically adjust all custom curves to match the new dimensions
+		this->impl->config.adjustAllCustomCurves();
 	}
 	// If not initialized, config is just stored and will be used during initialize()
 }
@@ -721,6 +729,9 @@ void Processor::setInputParameters(
 	// must never receive a stale-size buffer from getNextAvailableInputBuffer(), and this
 	// keeps the buffer acquisition hot path free of initialization checks
 	if (this->impl->initialized && this->impl->needsReinit()) {
+		// Preserve live backend profiles that remain geometry-compatible (the sync is
+		// geometry-guarded); reinitialize() restores them from the configuration
+		this->impl->syncBackendProfilesToConfig();
 		this->impl->reinitialize();
 	}
 }
@@ -1575,15 +1586,21 @@ void Processor::setBackendConfig(const BackendConfig& config) {
 		Impl::throwIfUnsupportedLineFieldFeatures(this->impl->config, newBackend);
 
 		// Store new configuration
+		std::unique_ptr<BackendConfig> previousConfig =
+			this->impl->backendConfig ? this->impl->backendConfig->clone() : nullptr;
 		this->impl->backendConfig = config.clone();
 
 		// Switch backend (this will preserve all processing configuration)
 		try {
 			this->setBackend(newBackend);
 		} catch (...) {
-			// Keep the stored configuration consistent with the backend that actually
-			// exists (general rollback of a partially destroyed backend is out of scope)
-			this->impl->backendConfig = BackendUtils::createDefaultConfig(this->impl->backendType);
+			// Keep the stored configuration accurate: if the backend instance was not
+			// replaced, restore its previous configuration; if it was, the new clone is
+			// the truthful description of the instance that exists (general rollback of
+			// a partially destroyed backend is out of scope)
+			if (this->impl->backendType != newBackend) {
+				this->impl->backendConfig = std::move(previousConfig);
+			}
 			throw;
 		}
 	} else {

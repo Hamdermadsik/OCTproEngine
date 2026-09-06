@@ -324,9 +324,13 @@ void initializeProcessor(AppState* state) {
 		}
 
 		// Save background frame if it exists (still valid when e.g. only bscansPerBuffer changed)
+		// Both dimensions must match individually: equal element counts (64x8 vs 128x4)
+		// do not imply the same layout
 		savedFrameProfile = state->processor->getBackgroundFrameProfile();
-		canReuseFrameProfile = (savedFrameProfile.size() ==
-			static_cast<size_t>(state->dataParams.samplesPerAscan) * state->dataParams.ascansPerBscan);
+		const ope::ProcessorConfiguration& oldConfig = state->processor->getConfig();
+		canReuseFrameProfile = !savedFrameProfile.empty() &&
+			oldConfig.dataParams.signalLength == state->dataParams.samplesPerAscan &&
+			oldConfig.dataParams.ascansPerBscan == state->dataParams.ascansPerBscan;
 	}
 
 	// Recreate processor (either first init or params changed)

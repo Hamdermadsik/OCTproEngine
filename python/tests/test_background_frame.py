@@ -156,6 +156,27 @@ def test_frame_correction():
     print("  PASSED")
 
 
+def test_config_copy_and_type_change():
+    print("Test: config property is a copy; type change via set_config resizes buffers...")
+    proc = make_processor(1)
+    proc.initialize()
+
+    # The config property must return a copy: mutating it must not silently change
+    # the processor (and must not corrupt set_config's change detection)
+    cfg = proc.config
+    cfg.dataParams.signalLength = 999
+    assert proc.config.dataParams.signalLength == SIGNAL_LENGTH, "config property must be a copy"
+
+    # Data type change through a mutated copy must reallocate the input buffers
+    cfg = proc.config
+    cfg.dataParams.inputDataType = ope.DataType.UINT8
+    proc.set_config(cfg)
+    buffer = proc.get_next_available_buffer()
+    assert buffer.nbytes == SAMPLES_PER_BSCAN, \
+        f"Buffer must be uint8-sized ({SAMPLES_PER_BSCAN} bytes), got {buffer.nbytes}"
+    print("  PASSED")
+
+
 def test_unsupported_backend():
     print("Test: enabling on OpenCL backend must throw...")
     try:
@@ -181,6 +202,7 @@ def main():
     test_profile_roundtrip_and_reset()
     test_continuous_ema()
     test_frame_correction()
+    test_config_copy_and_type_change()
     test_unsupported_backend()
     print()
     print("All tests PASSED")
