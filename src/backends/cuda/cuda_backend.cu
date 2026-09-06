@@ -95,7 +95,6 @@ struct CudaBackend::Impl {
 	// Curve buffers
 	float* d_resampleCurve = nullptr;
 	float* d_windowCurve = nullptr;
-	float* d_dispersionCurve = nullptr;
 	cufftComplex* d_phaseCartesian = nullptr;
 	float* d_sinusoidalResampleCurve = nullptr;
 	
@@ -1690,13 +1689,10 @@ void CudaBackend::allocateDeviceBuffers() {
 	checkCudaErrors(cudaMalloc(&this->impl->d_resampleCurve, 
 		sizeof(float) * this->impl->signalLength));
 	
-	checkCudaErrors(cudaMalloc(&this->impl->d_windowCurve, 
+	checkCudaErrors(cudaMalloc(&this->impl->d_windowCurve,
 		sizeof(float) * this->impl->signalLength));
-	
-	checkCudaErrors(cudaMalloc(&this->impl->d_dispersionCurve, 
-		sizeof(float) * this->impl->signalLength));
-	
-	checkCudaErrors(cudaMalloc(&this->impl->d_phaseCartesian, 
+
+	checkCudaErrors(cudaMalloc(&this->impl->d_phaseCartesian,
 		sizeof(cufftComplex) * this->impl->signalLength));
 	
 	checkCudaErrors(cudaMalloc(&this->impl->d_sinusoidalResampleCurve, 
@@ -1754,7 +1750,6 @@ void CudaBackend::releaseDeviceBuffers() {
 	// Free curve buffers
 	if (this->impl->d_resampleCurve) { cudaFree(this->impl->d_resampleCurve); this->impl->d_resampleCurve = nullptr; }
 	if (this->impl->d_windowCurve) { cudaFree(this->impl->d_windowCurve); this->impl->d_windowCurve = nullptr; }
-	if (this->impl->d_dispersionCurve) { cudaFree(this->impl->d_dispersionCurve); this->impl->d_dispersionCurve = nullptr; }
 	if (this->impl->d_phaseCartesian) { cudaFree(this->impl->d_phaseCartesian); this->impl->d_phaseCartesian = nullptr; }
 	if (this->impl->d_sinusoidalResampleCurve) { cudaFree(this->impl->d_sinusoidalResampleCurve); this->impl->d_sinusoidalResampleCurve = nullptr; }
 	

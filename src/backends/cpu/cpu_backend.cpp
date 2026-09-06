@@ -728,10 +728,7 @@ void CpuBackend::cleanup() {
 	while (!this->impl->workQueue.empty()) {
 		this->impl->workQueue.pop();
 	}
-	while (!this->impl->workQueue.empty()) {
-	this->impl->workQueue.pop();
-	}
-	
+
 	// Release vector memory
 	std::vector<std::vector<std::complex<float>>>().swap(this->impl->accumulatedIfftOutputs);
 	this->impl->accumulatedAscanCount = 0;

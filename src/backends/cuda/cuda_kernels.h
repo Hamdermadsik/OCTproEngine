@@ -61,14 +61,6 @@ __global__ void klinearization(
 	int samplesPerBuffer
 );
 
-__global__ void klinearizationQuadratic(
-	cufftComplex* __restrict__ out,
-	const cufftComplex* __restrict__ in,
-	const float* __restrict__ resampleCurve,
-	int samplesPerLine,
-	int samplesPerBuffer
-);
-
 __global__ void klinearizationCubic(
 	cufftComplex* __restrict__ out,
 	const cufftComplex* __restrict__ in,
@@ -183,14 +175,6 @@ __global__ void dispersionCompensationAndWindowing(
 	const float* windowCurve,
 	int samplesPerLine,
 	int samplesPerBuffer
-);
-
-__global__ void fillDispersivePhase(
-	cufftComplex* __restrict__ phaseComplex,
-	const float* __restrict__ dispersionCurve,
-	float factor,
-	int size,
-	int direction
 );
 
 // ============================================

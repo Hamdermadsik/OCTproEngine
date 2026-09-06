@@ -147,31 +147,6 @@ __global__ void klinearization(cufftComplex* __restrict__ out,
 	out[index].y = 0;
 }
 
-__global__ void klinearizationQuadratic(cufftComplex* __restrict__ out,
-                                       const cufftComplex* __restrict__ in,
-                                       const float* __restrict__ resampleCurve,
-                                       const int width,
-                                       const int samples) {
-	int index = threadIdx.x + blockIdx.x * blockDim.x;
-	int j = index%width;
-	int offset = index-j;
-
-	float x = resampleCurve[j];
-	int x0 = (int)x;
-	int x1 = x0 + 1;
-	int x2 = x0 + 2;
-
-	float f_x0 = in[offset + x0].x;
-	float f_x1 = in[offset + x1].x;
-	float f_x2 = in[offset + x2].x;
-	float b0 = f_x0;
-	float b1 = f_x1-f_x0;
-	float b2 = ((f_x2-f_x1)-b1)/(x2-x0);
-
-	out[index].x = b0 + b1 * (x - x0) + b2*(x-x0)*(x-x1);
-	out[index].y = 0;
-}
-
 __forceinline__ __device__ float cubicHermiteInterpolation(const float y0,
                                                           const float y1,
                                                           const float y2,
@@ -536,18 +511,6 @@ __global__ void dispersionCompensationAndWindowing(cufftComplex* out,
 		float inX = in[index].x * window[lineIndex];
 		out[index].x = inX * phaseComplex[lineIndex].x;
 		out[index].y = inX * phaseComplex[lineIndex].y;
-	}
-}
-
-__global__ void fillDispersivePhase(cufftComplex* __restrict__ phaseComplex,
-                                   const float* __restrict__ dispersionCurve,
-                                   float factor,
-                                   int size,
-                                   int direction) {
-	int index = blockIdx.x;
-	if (index < size) {
-		phaseComplex[index].x = cosf(factor*dispersionCurve[index]);
-		phaseComplex[index].y = sinf(factor*dispersionCurve[index]) * direction;
 	}
 }
 
