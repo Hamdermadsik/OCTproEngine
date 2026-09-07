@@ -646,11 +646,11 @@ void testValidationRejection() {
 		"A rejected profile file must leave the previous profile untouched");
 }
 
-// A dimension change must invalidate the frame immediately (before the lazy reinit runs)
-// and after it - including changes that keep the element count identical (equal
-// samplesPerBscan, incompatible layout)
+// A dimension change must invalidate the frame across the eager reinitialization and
+// any explicit re-initialization - including changes that keep the element count
+// identical (equal samplesPerBscan, incompatible layout)
 void testDimensionChangeInvalidatesFrame(ope::Backend backend) {
-	std::cout << "  Dimension change invalidates the frame (equal element count, before/after reinit)..." << std::endl;
+	std::cout << "  Dimension change invalidates the frame (equal element count, across reinit)..." << std::endl;
 
 	ope::Processor processor(backend);
 	configurePassthrough(processor, 1);
@@ -659,12 +659,12 @@ void testDimensionChangeInvalidatesFrame(ope::Backend backend) {
 	processor.setBackgroundFrameProfile(background.data(), SIGNAL_LENGTH, ASCANS_PER_BSCAN);
 	TEST_ASSERT(processor.hasBackgroundFrameProfile(), "Profile must exist before the change");
 
-	// Equal element count, different layout: 2*signalLength x ascans/2
+	// Equal element count, different layout: 2*signalLength x ascans/2 (reinitializes eagerly)
 	processor.setInputParameters(SIGNAL_LENGTH * 2, ASCANS_PER_BSCAN / 2, 1, ope::DataType::UINT16);
-	TEST_ASSERT(!processor.hasBackgroundFrameProfile(), "Stale frame must not be visible before the lazy reinit");
-	TEST_ASSERT(processor.getBackgroundFrameProfile().empty(), "Stale frame must not be returned before the lazy reinit");
+	TEST_ASSERT(!processor.hasBackgroundFrameProfile(), "Stale frame must not be visible after the dimension change");
+	TEST_ASSERT(processor.getBackgroundFrameProfile().empty(), "Stale frame must not be returned after the dimension change");
 
-	processor.initialize();  // runs the pending reinitialization
+	processor.initialize();  // explicit re-initialization must not resurrect it either
 	TEST_ASSERT(!processor.hasBackgroundFrameProfile(), "Stale frame must not survive reinitialization");
 }
 

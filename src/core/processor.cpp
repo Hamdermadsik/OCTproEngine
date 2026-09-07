@@ -290,29 +290,6 @@ public:
 		this->updateBackendDispersionCurve();
 	}
 
-	// Line-field OCT features (background frame subtraction, post-FFT frame correction)
-	// are implemented in all backends
-	static bool backendSupportsLineFieldFeatures(Backend type) {
-		(void)type;
-		return true;
-	}
-
-	static void throwIfLineFieldUnsupported(Backend type) {
-		if (!backendSupportsLineFieldFeatures(type)) {
-			throw std::runtime_error(
-				"Background frame subtraction and post-FFT frame correction are not yet "
-				"supported on this backend."
-			);
-		}
-	}
-
-	static void throwIfUnsupportedLineFieldFeatures(const ProcessorConfiguration& config, Backend type) {
-		if (config.processingParams.backgroundFrame.enabled ||
-			config.processingParams.frameCorrection.enabled) {
-			throwIfLineFieldUnsupported(type);
-		}
-	}
-
 	// Push explicitly replaced profiles from the configuration to the backend.
 	// Unchanged or absent profiles are left alone so live (EMA-advanced or freshly
 	// recorded) calibrations survive unrelated settings changes; explicit clearing
@@ -337,9 +314,8 @@ public:
 	}
 
 	// The backend's live background frame is only meaningful while the geometry it was
-	// initialized with still matches the configuration (a pending lazy reinit may not
-	// have run yet). Pure metadata check - never fetches the frame from the device,
-	// so it is safe for GUI status polling
+	// initialized with still matches the configuration. Pure metadata check - never
+	// fetches the frame from the device, so it is safe for GUI status polling
 	bool backendFrameGeometryCurrent() const {
 		return this->initialized &&
 		       this->lastInitializedDataParams.signalLength == this->config.dataParams.signalLength &&
@@ -351,7 +327,7 @@ public:
 	// Writes go to an explicit destination so callers can use short-lived local
 	// configurations: impl->config must stay the unmodified baseline that setConfig()
 	// compares against to detect user-requested profile changes
-	void syncBackendProfilesToConfig(ProcessorConfiguration& dest) {
+	void syncBackendLineProfilesToConfig(ProcessorConfiguration& dest) {
 		if (!this->initialized) return;
 
 		// Line profiles are only meaningful while the backend's initialized signal length
@@ -371,6 +347,13 @@ public:
 		if (linesCompatible && !fpnProfile.empty() && fpnProfile != dest.getFixedPatternNoiseProfile()) {
 			dest.setFixedPatternNoiseProfile(fpnProfile);
 		}
+	}
+
+	// Separate from the line profiles: fetching the frame is a device drain and a
+	// multi-megabyte readback on GPU backends, so control paths that do not need it
+	// (INI and line profile saves) must not pay for it
+	void syncBackendFrameProfileToConfig(ProcessorConfiguration& dest) {
+		if (!this->initialized) return;
 
 		// Never label a stale-geometry frame with the current dimensions
 		bool frameCompatible =
@@ -386,6 +369,11 @@ public:
 		}
 	}
 
+	void syncBackendProfilesToConfig(ProcessorConfiguration& dest) {
+		this->syncBackendLineProfilesToConfig(dest);
+		this->syncBackendFrameProfileToConfig(dest);
+	}
+
 	void ensureInitialized() {
 		if (!this->initialized) {
 			this->initialize();
@@ -398,7 +386,6 @@ public:
 		if (!this->config.validate()) {
 			throw std::runtime_error("Invalid processor configuration");
 		}
-		throwIfUnsupportedLineFieldFeatures(this->config, this->backendType);
 
 		this->nextBufferId = 0;
 
@@ -445,7 +432,6 @@ public:
 		if (!initConfig.validate()) {
 			throw std::runtime_error("Invalid processor configuration");
 		}
-		throwIfUnsupportedLineFieldFeatures(initConfig, this->backendType);
 
 		// Restart buffer IDs like initialize() does: the backends' ordered callback
 		// delivery restarts at ID 0 after their initialization
@@ -627,9 +613,10 @@ void Processor::loadConfigurationFromFile(const std::string& filepath) {
 }
 
 void Processor::saveConfigurationToFile(const std::string& filepath) const {
-	// Include profiles recorded by the backend since the last sync
+	// Include line profiles recorded by the backend since the last sync. The background
+	// frame is excluded from the INI, so it is not fetched here
 	ProcessorConfiguration saveConfig = this->impl->config;
-	this->impl->syncBackendProfilesToConfig(saveConfig);
+	this->impl->syncBackendLineProfilesToConfig(saveConfig);
 	if (!saveConfig.saveToFile(filepath)) {
 		throw std::runtime_error("Failed to save configuration to: " + filepath);
 	}
@@ -656,7 +643,6 @@ void Processor::setConfig(const ProcessorConfiguration& config) {
 	if (!config.validate()) {
 		throw std::invalid_argument("Invalid processor configuration");
 	}
-	Impl::throwIfUnsupportedLineFieldFeatures(config, this->impl->backendType);
 
 	// Check if buffer dimensions changed. Compared against the parameters the backend was
 	// actually initialized with: the incoming configuration may alias the stored one
@@ -745,12 +731,9 @@ void Processor::setInputParameters(
 	// If signalLength changed, re-adjust all custom curves
 	// (the background frame also depends on ascansPerBscan, so adjust on that change too)
 	if (samplesPerRawAscan != oldSignalLength || ascansPerBscan != oldAscansPerBscan) {
+		// The eager reinitialization below uploads the adjusted curves into the
+		// freshly sized backend allocations
 		this->impl->config.adjustAllCustomCurves();
-
-		// Update backend with new curves if initialized
-		if (this->impl->initialized) {
-			this->impl->updateAllBackendCurves();
-		}
 	}
 
 	// Reinitialize immediately when running (same eager behavior as setConfig): the caller
@@ -781,9 +764,6 @@ void Processor::setBackend(Backend backend) {
 	if (this->impl->backendType == backend) {
 		return;
 	}
-
-	// Validate before committing: the new backend must support all enabled features
-	Impl::throwIfUnsupportedLineFieldFeatures(this->impl->config, backend);
 
 	// Remember if old backend was initialized
 	bool wasInitialized = this->impl->initialized;
@@ -1159,10 +1139,6 @@ void Processor::enableSinusoidalScanCorrection(bool enable) {
 // ============================================
 
 void Processor::enableBackgroundFrameSubtraction(bool enable) {
-	// Validate before committing: enabling on an unsupported backend must not change state
-	if (enable) {
-		Impl::throwIfLineFieldUnsupported(this->impl->backendType);
-	}
 	this->impl->config.processingParams.backgroundFrame.enabled = enable;
 	if (this->impl->initialized) {
 		this->impl->backend->updateConfig(this->impl->config);
@@ -1201,13 +1177,11 @@ void Processor::setBackgroundFrameSmoothing(bool enable, int windowRadius) {
 }
 
 void Processor::requestBackgroundFrameRecording() {
-	Impl::throwIfLineFieldUnsupported(this->impl->backendType);
 	this->impl->backend->requestBackgroundFrameRecording();
 }
 
 void Processor::resetBackgroundFrame() {
-	// Works on every backend: OpenCL/Vulkan store the profile host-side and must be
-	// able to clear it even though they do not process the feature yet
+	// Works on every backend, also before initialization (the profile is stored host-side)
 	this->impl->backend->resetBackgroundFrame();
 	// Also clear the configuration copy so getters do not fall back to the old profile
 	this->impl->config.clearBackgroundFrameProfile();
@@ -1273,7 +1247,7 @@ bool Processor::hasBackgroundFrameProfile() const {
 void Processor::saveBackgroundFrameProfileToFile(const std::string& filepath) const {
 	// Snapshot the current frame from the backend first (it may have been recorded or EMA-updated)
 	ProcessorConfiguration snapshot = this->impl->config;
-	this->impl->syncBackendProfilesToConfig(snapshot);
+	this->impl->syncBackendFrameProfileToConfig(snapshot);
 	if (!snapshot.hasCustomBackgroundFrameProfile()) {
 		throw std::runtime_error("No background frame profile to save");
 	}
@@ -1303,10 +1277,6 @@ void Processor::loadBackgroundFrameProfileFromFile(const std::string& filepath) 
 // ============================================
 
 void Processor::enablePostFftFrameCorrection(bool enable) {
-	// Validate before committing: enabling on an unsupported backend must not change state
-	if (enable) {
-		Impl::throwIfLineFieldUnsupported(this->impl->backendType);
-	}
 	this->impl->config.processingParams.frameCorrection.enabled = enable;
 	if (this->impl->initialized) {
 		this->impl->backend->updateConfig(this->impl->config);
@@ -1408,7 +1378,7 @@ void Processor::saveFixedPatternNoiseProfileToFile(const std::string& filepath) 
 	// Snapshot the live backend profile first (it may have been recorded since the
 	// configuration was last synced)
 	ProcessorConfiguration snapshot = this->impl->config;
-	this->impl->syncBackendProfilesToConfig(snapshot);
+	this->impl->syncBackendLineProfilesToConfig(snapshot);
 	const std::vector<float> profileVec = snapshot.getFixedPatternNoiseProfile();
 
 	if (profileVec.empty()) {
@@ -1540,7 +1510,7 @@ void Processor::savePostProcessBackgroundProfileToFile(const std::string& filepa
 	// Snapshot the live backend profile first (it may have been recorded since the
 	// configuration was last synced)
 	ProcessorConfiguration snapshot = this->impl->config;
-	this->impl->syncBackendProfilesToConfig(snapshot);
+	this->impl->syncBackendLineProfilesToConfig(snapshot);
 	const std::vector<float> curveVec = snapshot.getBackgroundProfile();
 
 	if (curveVec.empty()) {
@@ -1650,9 +1620,6 @@ void Processor::setBackendConfig(const BackendConfig& config) {
 	// Check if we need to switch backends
 	Backend newBackend = config.getBackendType();
 	if (this->impl->backendType != newBackend) {
-		// Validate before committing: the new backend must support all enabled features
-		Impl::throwIfUnsupportedLineFieldFeatures(this->impl->config, newBackend);
-
 		// Store new configuration
 		std::unique_ptr<BackendConfig> previousConfig =
 			this->impl->backendConfig ? this->impl->backendConfig->clone() : nullptr;
