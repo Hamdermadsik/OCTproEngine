@@ -1,0 +1,49 @@
+#version 450
+
+// Background Frame Smoothing Shader (Line-Field OCT)
+// Smooths each A-scan's background spectrum with a rolling average filter
+// (window = 2*windowRadius+1, clamped at spectrum edges, never crossing
+// into a neighboring A-scan)
+
+layout(local_size_x = WORKGROUP_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+// ============================================
+// Descriptor Bindings
+// ============================================
+layout(binding = 0) buffer SmoothedBuffer {
+	float data[];  // Output: smoothed background frame (size: samplesPerBscan)
+} smoothedBuf;
+
+layout(binding = 1) buffer BackgroundFrameBuffer {
+	float data[];  // Input: background frame (size: samplesPerBscan)
+} frameBuf;
+
+// ============================================
+// Push Constants
+// ============================================
+layout(push_constant) uniform PushConstants {
+	uint windowRadius;
+	uint samplesPerLine;
+	uint samplesPerBscan;
+} params;
+
+void main() {
+	uint index = gl_GlobalInvocationID.x;
+	if (index >= params.samplesPerBscan) {
+		return;
+	}
+
+	int idx = int(index);
+	int radius = int(params.windowRadius);
+	int samplesPerLine = int(params.samplesPerLine);
+	int sampleIndex = idx % samplesPerLine;
+	int firstIndexOfLine = idx - sampleIndex;
+	int startIdx = max(firstIndexOfLine, idx - radius);
+	int endIdx = min(firstIndexOfLine + samplesPerLine - 1, idx + radius);
+
+	float sum = 0.0f;
+	for (int i = startIdx; i <= endIdx; i++) {
+		sum += frameBuf.data[i];
+	}
+	smoothedBuf.data[index] = sum / float(endIdx - startIdx + 1);
+}

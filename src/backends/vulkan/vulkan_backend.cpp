@@ -456,6 +456,60 @@ struct VulkanBackend::Impl {
 	VkPipeline backgroundRecordingPipeline = VK_NULL_HANDLE;
 	std::vector<VkDescriptorSet> backgroundRecordingDescriptorSets;
 
+	// Line-field OCT pipeline resources (background frame + post-FFT frame correction).
+	// All per-buffer variation is baked at record time; boundary buffers (recording
+	// start/completion, EMA bootstrap) re-record via the existing invalidation mechanism
+	VkPipelineLayout bgFrameUpdatePipelineLayout = VK_NULL_HANDLE;
+	VkDescriptorSetLayout bgFrameUpdateDescriptorSetLayout = VK_NULL_HANDLE;
+	VkPipeline bgFrameUpdatePipeline = VK_NULL_HANDLE;
+	std::vector<VkDescriptorSet> bgFrameUpdateDescriptorSets;       // per cmdBuf (fft input)
+
+	VkPipelineLayout bgFrameSmoothPipelineLayout = VK_NULL_HANDLE;
+	VkDescriptorSetLayout bgFrameSmoothDescriptorSetLayout = VK_NULL_HANDLE;
+	VkPipeline bgFrameSmoothPipeline = VK_NULL_HANDLE;
+	VkDescriptorSet bgFrameSmoothDescriptorSet = VK_NULL_HANDLE;    // shared buffers only
+
+	VkPipelineLayout bgFrameSubtractionPipelineLayout = VK_NULL_HANDLE;
+	VkDescriptorSetLayout bgFrameSubtractionDescriptorSetLayout = VK_NULL_HANDLE;
+	VkPipeline bgFrameSubtractionPipeline = VK_NULL_HANDLE;
+	std::vector<VkDescriptorSet> bgFrameSubtractionDescriptorSets;  // per cmdBuf (fft in-place)
+
+	VkPipelineLayout avgSpectraPipelineLayout = VK_NULL_HANDLE;
+	VkDescriptorSetLayout avgSpectraDescriptorSetLayout = VK_NULL_HANDLE;
+	VkPipeline avgSpectraPipeline = VK_NULL_HANDLE;
+	std::vector<VkDescriptorSet> avgSpectraDescriptorSets;          // per cmdBuf
+
+	VkPipelineLayout frameCorrectionPipelineLayout = VK_NULL_HANDLE;
+	VkDescriptorSetLayout frameCorrectionDescriptorSetLayout = VK_NULL_HANDLE;
+	VkPipeline frameCorrectionPipeline = VK_NULL_HANDLE;
+	std::vector<std::array<VkDescriptorSet, 2>> frameCorrectionDescriptorSets;  // [cmdBuf][variant]: 0=FFT input, 1=Intermediate input
+
+	// Line-field OCT device buffers (shared across command buffer slots; the single
+	// in-order compute queue plus per-pass barriers order all accesses)
+	VkBuffer backgroundFrameBuffer = VK_NULL_HANDLE;
+	VkDeviceMemory backgroundFrameMemory = VK_NULL_HANDLE;
+	VkBuffer backgroundSmoothedFrameBuffer = VK_NULL_HANDLE;
+	VkDeviceMemory backgroundSmoothedFrameMemory = VK_NULL_HANDLE;
+	VkBuffer backgroundAccumulatorBuffer = VK_NULL_HANDLE;
+	VkDeviceMemory backgroundAccumulatorMemory = VK_NULL_HANDLE;
+	VkBuffer backgroundFrameStagingBuffer = VK_NULL_HANDLE;         // host-visible, for finalize readback and snapshots
+	VkDeviceMemory backgroundFrameStagingMemory = VK_NULL_HANDLE;
+	void* backgroundFrameStagingMapped = nullptr;
+	std::vector<VkBuffer> liveSpectralAveragesBuffers;              // per cmdBuf scratch
+	std::vector<VkDeviceMemory> liveSpectralAveragesMemories;
+
+	// Line-field OCT host state (mirrors the CUDA/OpenCL backends)
+	std::vector<float> recordedBackgroundFrame;  // host mirror, refreshed on finalize/setProfile
+	bool backgroundFrameValid = false;
+	bool backgroundRecordingInProgress = false;
+	int backgroundBscansRecorded = 0;
+	int backgroundBscansTarget = 0;              // latched at requestBackgroundFrameRecording()
+	bool smoothedFrameDirty = true;
+	int backgroundBscansToProcessBake = 0;       // values baked into the recorded commands
+	bool backgroundFinalizeBake = false;
+	bool backgroundEmaBootstrapBake = false;
+	std::atomic<uint64_t> backgroundFinalizeSignalValue{0};  // completion thread reads the staging frame at this value
+
 	// Shader modules (will be created later)
 	std::vector<VkShaderModule> shaderModules;
 	std::vector<VkPipeline> computePipelines;
@@ -662,6 +716,26 @@ struct VulkanBackend::Impl {
 					this->config.setFixedPatternNoiseProfile(
 						this->recordedFixedPatternNoise
 					);
+				}
+			}
+
+			// Line-field OCT: deferred background frame finalization. The recorded commands
+			// finalized the frame on-GPU and copied it to the staging buffer; once the
+			// completing buffer's timeline value is reached, read it back and sync it
+			{
+				uint64_t finalizeValue = this->backgroundFinalizeSignalValue.load(std::memory_order_acquire);
+				if (finalizeValue != 0 && work.timelineValue >= finalizeValue) {
+					size_t samplesPerBscan = static_cast<size_t>(this->signalLength) * this->ascansPerBscan;
+					this->recordedBackgroundFrame.resize(samplesPerBscan);
+					std::memcpy(this->recordedBackgroundFrame.data(),
+					            this->backgroundFrameStagingMapped,
+					            samplesPerBscan * sizeof(float));
+
+					// Sync to configuration so the profile survives backend switches
+					this->config.setBackgroundFrameProfile(
+						this->recordedBackgroundFrame, this->signalLength, this->ascansPerBscan);
+
+					this->backgroundFinalizeSignalValue.store(0, std::memory_order_release);
 				}
 			}
 
@@ -900,6 +974,155 @@ void VulkanBackend::Impl::recordAllCommandBuffers() {
 	                     0, nullptr);
 
 	// ============================================
+	// Line-Field OCT Pre-FFT Stage
+	// ============================================
+	// All values are baked at record time; boundary buffers (recording start/completion,
+	// EMA bootstrap) re-record via the invalidation mechanism. When the features are
+	// disabled nothing is recorded here, so the disabled path gains no dispatches.
+	{
+		const ProcessorConfiguration::ProcessingParameters::BackgroundFrame& bfParams =
+			this->config.processingParams.backgroundFrame;
+		bool bfRecording = this->backgroundRecordingInProgress;
+		// Continuous EMA only runs together with subtraction; recording takes precedence
+		// and EMA resumes on the next buffer, seeded by the freshly recorded frame
+		bool bfContinuous = bfParams.enabled && bfParams.continuousUpdate && !bfRecording;
+		bool bfSubtract = bfParams.enabled &&
+			(this->backgroundFrameValid || this->backgroundFinalizeBake || bfContinuous);
+		bool frameCorrectionEnabled = this->config.processingParams.frameCorrection.enabled;
+		uint32_t samplesPerBscanU = static_cast<uint32_t>(this->signalLength * this->ascansPerBscan);
+		uint32_t bgWorkgroups = (samplesPerBscanU + VULKAN_WORKGROUP_SIZE - 1) / VULKAN_WORKGROUP_SIZE;
+
+		VkBufferMemoryBarrier bgBarrier = {};
+		bgBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+		bgBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+		bgBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+		bgBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		bgBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		bgBarrier.offset = 0;
+		bgBarrier.size = VK_WHOLE_SIZE;
+
+		if (frameCorrectionEnabled) {
+			// Live per-A-scan spectral averages (must run before background subtraction
+			// removes the DC content). One workgroup per A-scan
+			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->avgSpectraPipeline);
+			vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->avgSpectraPipelineLayout,
+			                        0, 1, &this->avgSpectraDescriptorSets[idx], 0, nullptr);
+			uint32_t avgPush[2] = {
+				static_cast<uint32_t>(this->signalLength),
+				static_cast<uint32_t>(this->ascansPerBscan * this->bscansPerBuffer)
+			};
+			vkCmdPushConstants(cmd, this->avgSpectraPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+			                   0, sizeof(avgPush), avgPush);
+			vkCmdDispatch(cmd, static_cast<uint32_t>(this->ascansPerBscan * this->bscansPerBuffer), 1, 1);
+
+			bgBarrier.buffer = this->liveSpectralAveragesBuffers[idx];
+			vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			                     0, 0, nullptr, 1, &bgBarrier, 0, nullptr);
+		}
+
+		if (bfRecording || bfContinuous) {
+			// Background frame update: recording accumulation/finalization and/or EMA.
+			// Each thread owns one background sample, so the sub-steps stay ordered
+			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->bgFrameUpdatePipeline);
+			vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->bgFrameUpdatePipelineLayout,
+			                        0, 1, &this->bgFrameUpdateDescriptorSets[idx], 0, nullptr);
+			struct BgFrameUpdatePushConstants {
+				uint32_t samplesPerBscan;
+				uint32_t bscansToAccumulate;
+				uint32_t finalizeRecording;
+				float finalizeNormFactor;
+				uint32_t runEma;
+				float emaAlpha;
+				uint32_t zeroFrameFirst;
+				uint32_t bscansInBuffer;
+			} updatePush;
+			updatePush.samplesPerBscan = samplesPerBscanU;
+			updatePush.bscansToAccumulate = bfRecording ? static_cast<uint32_t>(this->backgroundBscansToProcessBake) : 0u;
+			updatePush.finalizeRecording = this->backgroundFinalizeBake ? 1u : 0u;
+			updatePush.finalizeNormFactor = (this->backgroundBscansTarget > 0)
+				? 1.0f / static_cast<float>(this->backgroundBscansTarget) : 0.0f;
+			updatePush.runEma = bfContinuous ? 1u : 0u;
+			updatePush.emaAlpha = 1.0f / static_cast<float>(bfParams.bscansToAverage);
+			updatePush.zeroFrameFirst = this->backgroundEmaBootstrapBake ? 1u : 0u;
+			updatePush.bscansInBuffer = static_cast<uint32_t>(this->bscansPerBuffer);
+			vkCmdPushConstants(cmd, this->bgFrameUpdatePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+			                   0, sizeof(updatePush), &updatePush);
+			vkCmdDispatch(cmd, bgWorkgroups, 1, 1);
+
+			bgBarrier.buffer = this->backgroundFrameBuffer;
+			bgBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+			vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+			                     0, 0, nullptr, 1, &bgBarrier, 0, nullptr);
+			bgBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+		}
+
+		if (this->backgroundFinalizeBake) {
+			// Recording completes with this buffer: copy the finalized frame to the staging
+			// buffer; the completion thread reads it back once this buffer's timeline value
+			// is reached (deferred finalization)
+			VkBufferCopy frameCopyRegion = {};
+			frameCopyRegion.size = static_cast<VkDeviceSize>(samplesPerBscanU) * sizeof(float);
+			vkCmdCopyBuffer(cmd, this->backgroundFrameBuffer, this->backgroundFrameStagingBuffer, 1, &frameCopyRegion);
+
+			VkBufferMemoryBarrier frameCopyBarrier = bgBarrier;
+			frameCopyBarrier.buffer = this->backgroundFrameStagingBuffer;
+			frameCopyBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+			frameCopyBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+			vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+			                     0, 0, nullptr, 1, &frameCopyBarrier, 0, nullptr);
+		}
+
+		if (bfSubtract) {
+			bool inStageSmoothing = bfParams.smoothSpectra && (bfRecording || bfContinuous);
+			if (inStageSmoothing) {
+				// Writer regime: rebuild the smoothed frame in-stage
+				vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->bgFrameSmoothPipeline);
+				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->bgFrameSmoothPipelineLayout,
+				                        0, 1, &this->bgFrameSmoothDescriptorSet, 0, nullptr);
+				uint32_t smoothPush[3] = {
+					static_cast<uint32_t>(bfParams.smoothingWindowRadius),
+					static_cast<uint32_t>(this->signalLength),
+					samplesPerBscanU
+				};
+				vkCmdPushConstants(cmd, this->bgFrameSmoothPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+				                   0, sizeof(smoothPush), smoothPush);
+				vkCmdDispatch(cmd, bgWorkgroups, 1, 1);
+
+				bgBarrier.buffer = this->backgroundSmoothedFrameBuffer;
+				vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				                     0, 0, nullptr, 1, &bgBarrier, 0, nullptr);
+			}
+			// Static regime: the cached smoothed frame was uploaded on the control path;
+			// a stale cache falls back to the raw frame rather than reading a stale buffer
+			bool useSmoothed = bfParams.smoothSpectra && (inStageSmoothing || !this->smoothedFrameDirty);
+
+			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->bgFrameSubtractionPipeline);
+			vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->bgFrameSubtractionPipelineLayout,
+			                        0, 1, &this->bgFrameSubtractionDescriptorSets[idx], 0, nullptr);
+			struct BgFrameSubtractionPushConstants {
+				uint32_t samplesPerBscan;
+				uint32_t samplesPerBuffer;
+				uint32_t normalize;
+				uint32_t useSmoothed;
+				float normalizationScale;
+			} subtractPush;
+			subtractPush.samplesPerBscan = samplesPerBscanU;
+			subtractPush.samplesPerBuffer = static_cast<uint32_t>(this->samplesPerBuffer);
+			subtractPush.normalize = bfParams.normalize ? 1u : 0u;
+			subtractPush.useSmoothed = useSmoothed ? 1u : 0u;
+			subtractPush.normalizationScale = sqrtf(powf(2.0f, static_cast<float>(this->config.dataParams.getBitDepth())));
+			vkCmdPushConstants(cmd, this->bgFrameSubtractionPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+			                   0, sizeof(subtractPush), &subtractPush);
+			vkCmdDispatch(cmd, numWorkgroups, 1, 1);
+
+			bgBarrier.buffer = this->deviceFftBuffers[idx];
+			vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			                     0, 0, nullptr, 1, &bgBarrier, 0, nullptr);
+		}
+	}
+
+	// ============================================
 	// Preprocessing Pipeline (before FFT)
 	// ============================================
 	// Note: Descriptor sets enforce fixed buffer routing:
@@ -1034,6 +1257,42 @@ void VulkanBackend::Impl::recordAllCommandBuffers() {
 	                     0, nullptr,
 	                     1, &fftOutputBarrier,
 	                     0, nullptr);
+
+	// ============================================
+	// Line-Field OCT Post-FFT Frame Correction
+	// ============================================
+	// Divides each A-scan by the square root of its pre-subtraction spectral average.
+	// Must run before FPN determination, which samples the corrected complex data
+
+	if (this->config.processingParams.frameCorrection.enabled) {
+		int correctionVariant = dataInFftBuffer ? 0 : 1;
+		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->frameCorrectionPipeline);
+		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, this->frameCorrectionPipelineLayout,
+		                        0, 1, &this->frameCorrectionDescriptorSets[idx][correctionVariant], 0, nullptr);
+		struct FrameCorrectionPushConstants {
+			uint32_t samplesPerLine;
+			uint32_t samplesPerBuffer;
+			float normalizationScale;
+		} correctionPush;
+		correctionPush.samplesPerLine = static_cast<uint32_t>(this->signalLength);
+		correctionPush.samplesPerBuffer = static_cast<uint32_t>(this->samplesPerBuffer);
+		correctionPush.normalizationScale = sqrtf(powf(2.0f, static_cast<float>(this->config.dataParams.getBitDepth())));
+		vkCmdPushConstants(cmd, this->frameCorrectionPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+		                   0, sizeof(correctionPush), &correctionPush);
+		vkCmdDispatch(cmd, numWorkgroups, 1, 1);
+
+		VkBufferMemoryBarrier correctionBarrier = {};
+		correctionBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+		correctionBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+		correctionBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+		correctionBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		correctionBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		correctionBarrier.buffer = *fftBuffer;
+		correctionBarrier.offset = 0;
+		correctionBarrier.size = VK_WHOLE_SIZE;
+		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		                     0, 0, nullptr, 1, &correctionBarrier, 0, nullptr);
+	}
 
 	// ============================================
 	// FPN Determination (if requested or continuous mode)
@@ -2093,11 +2352,24 @@ void VulkanBackend::initialize(const ProcessorConfiguration& config) {
 		this->setFixedPatternNoiseProfile(profileVec.data(), complexPairs);
 	}
 
-	// Re-seed the host-side background frame from the configuration: clears a frame that
-	// went stale through a dimension change and restores a valid one across reinitialization
-	this->backgroundFrameProfile = config.hasCustomBackgroundFrameProfile()
-		? config.getBackgroundFrameProfile()
-		: std::vector<float>();
+	// Reset background frame state and restore a configured profile (line-field OCT)
+	this->impl->backgroundFrameValid = false;
+	this->impl->backgroundRecordingInProgress = false;
+	this->impl->backgroundBscansRecorded = 0;
+	this->impl->backgroundBscansTarget = 0;
+	this->impl->backgroundBscansToProcessBake = 0;
+	this->impl->backgroundFinalizeBake = false;
+	this->impl->backgroundEmaBootstrapBake = false;
+	this->impl->backgroundFinalizeSignalValue.store(0, std::memory_order_release);
+	this->impl->smoothedFrameDirty = true;
+	this->impl->recordedBackgroundFrame.clear();
+	if (config.hasCustomBackgroundFrameProfile()) {
+		std::vector<float> frameVec = config.getBackgroundFrameProfile();
+		this->impl->recordedBackgroundFrame = frameVec;
+		this->uploadToDeviceBufferLocked(this->impl->backgroundFrameBuffer,
+			frameVec.data(), frameVec.size() * sizeof(float));
+		this->impl->backgroundFrameValid = true;
+	}
 
 	// Start async completion thread (handles fence polling and callbacks)
 	this->impl->completionThreadRunning = true;
@@ -2350,12 +2622,66 @@ void VulkanBackend::process(IOBuffer& input) {
 	outputBuf->setBackendIndex(stagingBufferIdx);  // Ensure index matches staging buffer
 	outputBuf->setExternalMemory(this->impl->stagingOutputMapped[stagingBufferIdx], outputSize);
 
+	// Line-field OCT: recording/EMA boundary buffers change what the recorded command
+	// buffers must contain. Only boundaries re-record (recording start via request,
+	// completion, EMA bootstrap) - never per steady-state buffer
+	{
+		const ProcessorConfiguration::ProcessingParameters::BackgroundFrame& bfParams =
+			this->impl->config.processingParams.backgroundFrame;
+		if (this->impl->backgroundRecordingInProgress) {
+			int bscansRemaining = this->impl->backgroundBscansTarget - this->impl->backgroundBscansRecorded;
+			int bscansToProcess = std::min(this->impl->bscansPerBuffer, bscansRemaining);
+			bool finalizeThisBuffer =
+				(this->impl->backgroundBscansRecorded + bscansToProcess >= this->impl->backgroundBscansTarget);
+			if (bscansToProcess != this->impl->backgroundBscansToProcessBake ||
+				finalizeThisBuffer != this->impl->backgroundFinalizeBake) {
+				this->impl->backgroundBscansToProcessBake = bscansToProcess;
+				this->impl->backgroundFinalizeBake = finalizeThisBuffer;
+				this->impl->commandBuffersValid = false;
+			}
+			this->impl->backgroundBscansRecorded += bscansToProcess;
+		} else if (bfParams.enabled && bfParams.continuousUpdate &&
+		           !this->impl->backgroundFrameValid && !this->impl->backgroundEmaBootstrapBake) {
+			// EMA bootstraps from a zeroed frame on this buffer only
+			this->impl->backgroundEmaBootstrapBake = true;
+			this->impl->commandBuffersValid = false;
+		}
+
+		// Static-regime smoothed cache: rebuilt once on the control path from the host
+		// mirror (never per buffer); the recorded subtraction then uses the cached copy
+		if (bfParams.enabled && bfParams.smoothSpectra &&
+			!bfParams.continuousUpdate && !this->impl->backgroundRecordingInProgress &&
+			this->impl->backgroundFrameValid && this->impl->smoothedFrameDirty &&
+			!this->impl->recordedBackgroundFrame.empty()) {
+			this->refreshStaticSmoothedFrame();
+			this->impl->commandBuffersValid = false;
+		}
+	}
+
 	// Record all command buffers if needed (first call, after config change, or after bg capture)
 	// Re-recording and submission are both protected by submitMutex
 	bool needRerecord = this->impl->needRerecordAfterBgCapture.exchange(false, std::memory_order_acq_rel);
 	if (!this->impl->commandBuffersValid || needRerecord) {
 		this->impl->recordAllCommandBuffers();
 		cmd = this->impl->commandBuffers[idx];  // Restore cmd to current frame buffer
+	}
+
+	// Line-field OCT boundary state transitions take effect for the NEXT buffer: this
+	// buffer's commands were recorded above with the boundary values baked in
+	if (this->impl->backgroundFinalizeBake) {
+		this->impl->backgroundFinalizeBake = false;
+		this->impl->backgroundBscansToProcessBake = 0;
+		this->impl->backgroundRecordingInProgress = false;
+		this->impl->backgroundFrameValid = true;
+		this->impl->smoothedFrameDirty = true;
+		// The completion thread reads the finalized frame at this buffer's timeline value
+		this->impl->backgroundFinalizeSignalValue.store(this->impl->nextOutputSignalValue, std::memory_order_release);
+		this->impl->needRerecordAfterBgCapture.store(true, std::memory_order_release);
+	}
+	if (this->impl->backgroundEmaBootstrapBake) {
+		this->impl->backgroundEmaBootstrapBake = false;
+		this->impl->backgroundFrameValid = true;
+		this->impl->needRerecordAfterBgCapture.store(true, std::memory_order_release);
 	}
 
 	// ============================================
@@ -2635,6 +2961,24 @@ void VulkanBackend::updateConfig(const ProcessorConfiguration& config) {
 	// === STEP 5: Mark command buffers invalid ===
 	// Command buffers always need re-recording on config change
 	this->impl->commandBuffersValid = false;
+
+	// Line-field OCT: smoothing settings changes and leaving continuous mode need the
+	// static smoothed cache refreshed from the live frame (the recorded in-stage
+	// smoothing pass no longer runs in the static regime)
+	const ProcessorConfiguration::ProcessingParameters::BackgroundFrame& newBf =
+		config.processingParams.backgroundFrame;
+	if (this->impl->vulkanInitialized && this->impl->backgroundFrameValid &&
+		newBf.enabled && newBf.smoothSpectra && !newBf.continuousUpdate &&
+		!this->impl->backgroundRecordingInProgress) {
+		std::lock_guard<std::mutex> submitLock(this->impl->submitMutex);
+		checkVulkanErrors(vkDeviceWaitIdle(this->impl->device));
+		size_t samplesPerBscan = static_cast<size_t>(this->impl->signalLength) * this->impl->ascansPerBscan;
+		this->impl->recordedBackgroundFrame.resize(samplesPerBscan);
+		this->readbackDeviceBufferLocked(this->impl->backgroundFrameBuffer,
+			this->impl->recordedBackgroundFrame.data(), samplesPerBscan * sizeof(float));
+		this->impl->smoothedFrameDirty = true;
+		this->refreshStaticSmoothedFrame();
+	}
 }
 
 void VulkanBackend::updateResamplingCurve(const float* curve, size_t length) {
@@ -3254,25 +3598,218 @@ const std::vector<float>& VulkanBackend::getFixedPatternNoiseProfile() const {
 	return this->impl->recordedFixedPatternNoise;
 }
 
+// ============================================
+// Background Frame Methods (Line-Field OCT)
+// ============================================
+
+// Host-side rolling average smoothing for the static smoothed cache (same formula as
+// the background_frame_smooth.comp shader and the other backends)
+static void smoothBackgroundFrameHost(const std::vector<float>& frame, std::vector<float>& smoothed,
+                                      int windowRadius, int samplesPerLine) {
+	int samplesPerBscan = static_cast<int>(frame.size());
+	smoothed.resize(samplesPerBscan);
+	for (int index = 0; index < samplesPerBscan; ++index) {
+		int sampleIndex = index % samplesPerLine;
+		int firstIndexOfLine = index - sampleIndex;
+		int startIdx = std::max(firstIndexOfLine, index - windowRadius);
+		int endIdx = std::min(firstIndexOfLine + samplesPerLine - 1, index + windowRadius);
+		float sum = 0.0f;
+		for (int i = startIdx; i <= endIdx; ++i) {
+			sum += frame[i];
+		}
+		smoothed[index] = sum / static_cast<float>(endIdx - startIdx + 1);
+	}
+}
+
+void VulkanBackend::uploadToDeviceBufferLocked(VkBuffer dst, const float* src, size_t bytes) {
+	// One-shot staged upload (same steps as the curve update methods; caller holds
+	// submitMutex and has drained the device)
+	VkBuffer stagingBuffer;
+	VkDeviceMemory stagingMemory;
+	createBuffer(this->impl->device, this->impl->physicalDevice, bytes,
+	             VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+	             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+	             stagingBuffer, stagingMemory);
+
+	void* mappedMemory;
+	vkMapMemory(this->impl->device, stagingMemory, 0, bytes, 0, &mappedMemory);
+	memcpy(mappedMemory, src, bytes);
+	vkUnmapMemory(this->impl->device, stagingMemory);
+
+	VkCommandBufferAllocateInfo allocInfo = {};
+	allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+	allocInfo.commandPool = this->impl->commandPool;
+	allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+	allocInfo.commandBufferCount = 1;
+	VkCommandBuffer cmdBuffer;
+	vkAllocateCommandBuffers(this->impl->device, &allocInfo, &cmdBuffer);
+
+	VkCommandBufferBeginInfo beginInfo = {};
+	beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+	beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+	vkBeginCommandBuffer(cmdBuffer, &beginInfo);
+	VkBufferCopy copyRegion = {};
+	copyRegion.size = bytes;
+	vkCmdCopyBuffer(cmdBuffer, stagingBuffer, dst, 1, &copyRegion);
+	vkEndCommandBuffer(cmdBuffer);
+
+	VkSubmitInfo submitInfo = {};
+	submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+	submitInfo.commandBufferCount = 1;
+	submitInfo.pCommandBuffers = &cmdBuffer;
+	vkQueueSubmit(this->impl->computeQueue, 1, &submitInfo, VK_NULL_HANDLE);
+	vkQueueWaitIdle(this->impl->computeQueue);
+
+	vkFreeCommandBuffers(this->impl->device, this->impl->commandPool, 1, &cmdBuffer);
+	vkDestroyBuffer(this->impl->device, stagingBuffer, nullptr);
+	vkFreeMemory(this->impl->device, stagingMemory, nullptr);
+}
+
+void VulkanBackend::readbackDeviceBufferLocked(VkBuffer src, float* dst, size_t bytes) {
+	// One-shot copy through the persistent frame staging buffer (caller holds submitMutex
+	// and has drained the device; bytes never exceeds the staging allocation)
+	VkCommandBufferAllocateInfo allocInfo = {};
+	allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+	allocInfo.commandPool = this->impl->commandPool;
+	allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+	allocInfo.commandBufferCount = 1;
+	VkCommandBuffer cmdBuffer;
+	vkAllocateCommandBuffers(this->impl->device, &allocInfo, &cmdBuffer);
+
+	VkCommandBufferBeginInfo beginInfo = {};
+	beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+	beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+	vkBeginCommandBuffer(cmdBuffer, &beginInfo);
+	VkBufferCopy copyRegion = {};
+	copyRegion.size = bytes;
+	vkCmdCopyBuffer(cmdBuffer, src, this->impl->backgroundFrameStagingBuffer, 1, &copyRegion);
+	vkEndCommandBuffer(cmdBuffer);
+
+	VkSubmitInfo submitInfo = {};
+	submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+	submitInfo.commandBufferCount = 1;
+	submitInfo.pCommandBuffers = &cmdBuffer;
+	vkQueueSubmit(this->impl->computeQueue, 1, &submitInfo, VK_NULL_HANDLE);
+	vkQueueWaitIdle(this->impl->computeQueue);
+	vkFreeCommandBuffers(this->impl->device, this->impl->commandPool, 1, &cmdBuffer);
+
+	memcpy(dst, this->impl->backgroundFrameStagingMapped, bytes);
+}
+
+void VulkanBackend::refreshStaticSmoothedFrame() {
+	// Rebuild the static smoothed cache from the host mirror and upload it
+	std::vector<float> smoothed;
+	smoothBackgroundFrameHost(this->impl->recordedBackgroundFrame, smoothed,
+		this->impl->config.processingParams.backgroundFrame.smoothingWindowRadius,
+		this->impl->signalLength);
+	checkVulkanErrors(vkDeviceWaitIdle(this->impl->device));
+	this->uploadToDeviceBufferLocked(this->impl->backgroundSmoothedFrameBuffer,
+		smoothed.data(), smoothed.size() * sizeof(float));
+	this->impl->smoothedFrameDirty = false;
+}
+
 void VulkanBackend::requestBackgroundFrameRecording() {
-	throw std::runtime_error("Background frame recording is not yet supported on the Vulkan backend");
+	std::lock_guard<std::mutex> submitLock(this->impl->submitMutex);
+	if (!this->impl->vulkanInitialized) {
+		throw std::runtime_error("Vulkan backend not initialized");
+	}
+
+	// Drain so no in-flight buffer contributes to the fresh accumulator
+	checkVulkanErrors(vkDeviceWaitIdle(this->impl->device));
+
+	std::vector<float> zeros(static_cast<size_t>(this->impl->signalLength) * this->impl->ascansPerBscan, 0.0f);
+	this->uploadToDeviceBufferLocked(this->impl->backgroundAccumulatorBuffer,
+		zeros.data(), zeros.size() * sizeof(float));
+
+	this->impl->backgroundBscansRecorded = 0;
+	this->impl->backgroundBscansTarget = this->impl->config.processingParams.backgroundFrame.bscansToAverage;
+	this->impl->backgroundBscansToProcessBake = 0;
+	this->impl->backgroundFinalizeBake = false;
+	this->impl->backgroundRecordingInProgress = true;
+	this->impl->commandBuffersValid = false;
 }
 
 void VulkanBackend::setBackgroundFrameProfile(const float* frame, size_t samplesPerLine, size_t ascansPerBscan) {
-	// Stored host-side only so configuration save/load and backend switching preserve the profile
-	this->backgroundFrameProfile.assign(frame, frame + samplesPerLine * ascansPerBscan);
+	if (!frame || samplesPerLine == 0 || ascansPerBscan == 0) {
+		throw std::invalid_argument("Invalid background frame profile pointer");
+	}
+	if (samplesPerLine != static_cast<size_t>(this->impl->signalLength) ||
+		ascansPerBscan != static_cast<size_t>(this->impl->ascansPerBscan)) {
+		throw std::invalid_argument("Background frame profile dimensions do not match current configuration");
+	}
+
+	std::lock_guard<std::mutex> submitLock(this->impl->submitMutex);
+	if (!this->impl->vulkanInitialized) {
+		throw std::runtime_error("Vulkan backend not initialized");
+	}
+
+	// Drain so no in-flight buffer reads the frame while it is replaced
+	checkVulkanErrors(vkDeviceWaitIdle(this->impl->device));
+
+	size_t samplesPerBscan = samplesPerLine * ascansPerBscan;
+	this->uploadToDeviceBufferLocked(this->impl->backgroundFrameBuffer, frame, samplesPerBscan * sizeof(float));
+
+	// Update host copy
+	this->impl->recordedBackgroundFrame.assign(frame, frame + samplesPerBscan);
+	this->impl->backgroundFrameValid = true;
+	this->impl->smoothedFrameDirty = true;
+	this->impl->commandBuffersValid = false;
 }
 
 std::vector<float> VulkanBackend::getBackgroundFrameProfile() const {
-	return this->backgroundFrameProfile;
+	std::lock_guard<std::mutex> submitLock(this->impl->submitMutex);
+	if (!this->impl->backgroundFrameValid) {
+		return {};
+	}
+	if (!this->impl->vulkanInitialized) {
+		return this->impl->recordedBackgroundFrame;
+	}
+
+	// Snapshot the live device frame: during continuous EMA update the host mirror is
+	// stale, and this readback is only performed on explicit get/save/backend-transfer
+	// requests - never in the per-buffer hot path
+	checkVulkanErrors(vkDeviceWaitIdle(this->impl->device));
+
+	size_t samplesPerBscan = static_cast<size_t>(this->impl->signalLength) * this->impl->ascansPerBscan;
+	std::vector<float> snapshot(samplesPerBscan);
+	const_cast<VulkanBackend*>(this)->readbackDeviceBufferLocked(this->impl->backgroundFrameBuffer,
+		snapshot.data(), samplesPerBscan * sizeof(float));
+	return snapshot;
 }
 
 bool VulkanBackend::hasBackgroundFrameProfile() const {
-	return !this->backgroundFrameProfile.empty();
+	return this->impl->backgroundFrameValid;
 }
 
 void VulkanBackend::resetBackgroundFrame() {
-	this->backgroundFrameProfile.clear();
+	std::lock_guard<std::mutex> submitLock(this->impl->submitMutex);
+	if (!this->impl->vulkanInitialized) {
+		this->impl->recordedBackgroundFrame.clear();
+		this->impl->backgroundFrameValid = false;
+		this->impl->backgroundRecordingInProgress = false;
+		this->impl->backgroundBscansRecorded = 0;
+		this->impl->backgroundBscansTarget = 0;
+		return;
+	}
+
+	// Drain so no in-flight buffer reads the frame while it is cleared
+	checkVulkanErrors(vkDeviceWaitIdle(this->impl->device));
+
+	std::vector<float> zeros(static_cast<size_t>(this->impl->signalLength) * this->impl->ascansPerBscan, 0.0f);
+	this->uploadToDeviceBufferLocked(this->impl->backgroundFrameBuffer, zeros.data(), zeros.size() * sizeof(float));
+	this->uploadToDeviceBufferLocked(this->impl->backgroundAccumulatorBuffer, zeros.data(), zeros.size() * sizeof(float));
+
+	this->impl->recordedBackgroundFrame.clear();
+	this->impl->backgroundFrameValid = false;
+	this->impl->backgroundRecordingInProgress = false;
+	this->impl->backgroundBscansRecorded = 0;
+	this->impl->backgroundBscansTarget = 0;
+	this->impl->backgroundBscansToProcessBake = 0;
+	this->impl->backgroundFinalizeBake = false;
+	this->impl->backgroundEmaBootstrapBake = false;
+	this->impl->backgroundFinalizeSignalValue.store(0, std::memory_order_release);
+	this->impl->smoothedFrameDirty = true;
+	this->impl->commandBuffersValid = false;
 }
 
 
@@ -3527,6 +4064,38 @@ void VulkanBackend::allocateDeviceBuffers() {
 	// Map FPN staging buffer for persistent access
 	vkMapMemory(this->impl->device, this->impl->meanALineStagingMemory, 0, meanALineSize, 0, &this->impl->meanALineStagingMapped);
 
+	// Line-field OCT buffers (background frame + post-FFT frame correction). Preallocated
+	// unconditionally so the features can be enabled at runtime without reinitialization
+	VkDeviceSize samplesPerBscanSize = static_cast<VkDeviceSize>(this->impl->signalLength) * this->impl->ascansPerBscan * sizeof(float);
+	createBuffer(this->impl->device, this->impl->physicalDevice, samplesPerBscanSize,
+	             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+	             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+	             this->impl->backgroundFrameBuffer, this->impl->backgroundFrameMemory);
+	createBuffer(this->impl->device, this->impl->physicalDevice, samplesPerBscanSize,
+	             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+	             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+	             this->impl->backgroundSmoothedFrameBuffer, this->impl->backgroundSmoothedFrameMemory);
+	createBuffer(this->impl->device, this->impl->physicalDevice, samplesPerBscanSize,
+	             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+	             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+	             this->impl->backgroundAccumulatorBuffer, this->impl->backgroundAccumulatorMemory);
+	createBuffer(this->impl->device, this->impl->physicalDevice, samplesPerBscanSize,
+	             VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+	             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+	             this->impl->backgroundFrameStagingBuffer, this->impl->backgroundFrameStagingMemory);
+	vkMapMemory(this->impl->device, this->impl->backgroundFrameStagingMemory, 0, samplesPerBscanSize, 0, &this->impl->backgroundFrameStagingMapped);
+
+	// Per-slot spectral average scratch for post-FFT frame correction
+	VkDeviceSize averagesSize = static_cast<VkDeviceSize>(this->impl->ascansPerBscan) * this->impl->bscansPerBuffer * sizeof(float);
+	this->impl->liveSpectralAveragesBuffers.resize(this->impl->numCommandBuffers);
+	this->impl->liveSpectralAveragesMemories.resize(this->impl->numCommandBuffers);
+	for (int i = 0; i < this->impl->numCommandBuffers; ++i) {
+		createBuffer(this->impl->device, this->impl->physicalDevice, averagesSize,
+		             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+		             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+		             this->impl->liveSpectralAveragesBuffers[i], this->impl->liveSpectralAveragesMemories[i]);
+	}
+
 	// Initialize background buffer to zeros (so background subtraction works even without recording)
 	VkCommandBufferAllocateInfo allocInfo = {};
 	allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
@@ -3544,6 +4113,8 @@ void VulkanBackend::allocateDeviceBuffers() {
 	vkBeginCommandBuffer(initCmdBuffer, &beginInfo);
 	vkCmdFillBuffer(initCmdBuffer, this->impl->postProcBackgroundBuffer, 0, VK_WHOLE_SIZE, 0);  // Fill with zeros
 	vkCmdFillBuffer(initCmdBuffer, this->impl->meanALineBuffer, 0, VK_WHOLE_SIZE, 0);  // Zero-fill meanALineBuffer so pre-determination subtraction has no effect
+	vkCmdFillBuffer(initCmdBuffer, this->impl->backgroundFrameBuffer, 0, VK_WHOLE_SIZE, 0);
+	vkCmdFillBuffer(initCmdBuffer, this->impl->backgroundAccumulatorBuffer, 0, VK_WHOLE_SIZE, 0);
 	vkEndCommandBuffer(initCmdBuffer);
 
 	// Submit and wait for initialization
@@ -3707,6 +4278,54 @@ void VulkanBackend::releaseDeviceBuffers() {
 		vkDestroyBuffer(this->impl->device, this->impl->meanALineStagingBuffer, nullptr);
 		this->impl->meanALineStagingBuffer = VK_NULL_HANDLE;
 	}
+
+	// Line-field OCT buffers
+	if (this->impl->backgroundFrameBuffer != VK_NULL_HANDLE) {
+		vkDestroyBuffer(this->impl->device, this->impl->backgroundFrameBuffer, nullptr);
+		this->impl->backgroundFrameBuffer = VK_NULL_HANDLE;
+	}
+	if (this->impl->backgroundFrameMemory != VK_NULL_HANDLE) {
+		vkFreeMemory(this->impl->device, this->impl->backgroundFrameMemory, nullptr);
+		this->impl->backgroundFrameMemory = VK_NULL_HANDLE;
+	}
+	if (this->impl->backgroundSmoothedFrameBuffer != VK_NULL_HANDLE) {
+		vkDestroyBuffer(this->impl->device, this->impl->backgroundSmoothedFrameBuffer, nullptr);
+		this->impl->backgroundSmoothedFrameBuffer = VK_NULL_HANDLE;
+	}
+	if (this->impl->backgroundSmoothedFrameMemory != VK_NULL_HANDLE) {
+		vkFreeMemory(this->impl->device, this->impl->backgroundSmoothedFrameMemory, nullptr);
+		this->impl->backgroundSmoothedFrameMemory = VK_NULL_HANDLE;
+	}
+	if (this->impl->backgroundAccumulatorBuffer != VK_NULL_HANDLE) {
+		vkDestroyBuffer(this->impl->device, this->impl->backgroundAccumulatorBuffer, nullptr);
+		this->impl->backgroundAccumulatorBuffer = VK_NULL_HANDLE;
+	}
+	if (this->impl->backgroundAccumulatorMemory != VK_NULL_HANDLE) {
+		vkFreeMemory(this->impl->device, this->impl->backgroundAccumulatorMemory, nullptr);
+		this->impl->backgroundAccumulatorMemory = VK_NULL_HANDLE;
+	}
+	if (this->impl->backgroundFrameStagingMapped != nullptr) {
+		vkUnmapMemory(this->impl->device, this->impl->backgroundFrameStagingMemory);
+		this->impl->backgroundFrameStagingMapped = nullptr;
+	}
+	if (this->impl->backgroundFrameStagingBuffer != VK_NULL_HANDLE) {
+		vkDestroyBuffer(this->impl->device, this->impl->backgroundFrameStagingBuffer, nullptr);
+		this->impl->backgroundFrameStagingBuffer = VK_NULL_HANDLE;
+	}
+	if (this->impl->backgroundFrameStagingMemory != VK_NULL_HANDLE) {
+		vkFreeMemory(this->impl->device, this->impl->backgroundFrameStagingMemory, nullptr);
+		this->impl->backgroundFrameStagingMemory = VK_NULL_HANDLE;
+	}
+	for (size_t i = 0; i < this->impl->liveSpectralAveragesBuffers.size(); ++i) {
+		if (this->impl->liveSpectralAveragesBuffers[i] != VK_NULL_HANDLE) {
+			vkDestroyBuffer(this->impl->device, this->impl->liveSpectralAveragesBuffers[i], nullptr);
+		}
+		if (this->impl->liveSpectralAveragesMemories[i] != VK_NULL_HANDLE) {
+			vkFreeMemory(this->impl->device, this->impl->liveSpectralAveragesMemories[i], nullptr);
+		}
+	}
+	this->impl->liveSpectralAveragesBuffers.clear();
+	this->impl->liveSpectralAveragesMemories.clear();
 	if (this->impl->meanALineStagingMemory != VK_NULL_HANDLE) {
 		vkFreeMemory(this->impl->device, this->impl->meanALineStagingMemory, nullptr);
 		this->impl->meanALineStagingMemory = VK_NULL_HANDLE;
@@ -4053,13 +4672,13 @@ void VulkanBackend::createComputePipelines() {
 
 	VkDescriptorPoolSize poolSize = {};
 	poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-	poolSize.descriptorCount = static_cast<uint32_t>(this->impl->numCommandBuffers * 34);  // 2 (input conv) + 3 (windowing) + 2 (DC removal) + 3 (klinear) + 3 (dispersion) + 7 (universal pre-FFT) + 3 (universal post-FFT) + 2 (FPN determination) + 5 (merged klinear+windowing+dispersion) + 2 (background subtraction) + 2 (background recording) per command buffer
+	poolSize.descriptorCount = static_cast<uint32_t>(this->impl->numCommandBuffers * 47);  // 2 (input conv) + 3 (windowing) + 2 (DC removal) + 3 (klinear) + 3 (dispersion) + 7 (universal pre-FFT) + 3 (universal post-FFT) + 2 (FPN determination) + 5 (merged klinear+windowing+dispersion) + 2 (background subtraction) + 2 (background recording) + 13 (line-field: update 3, smooth 2, frame subtraction 3, spectral averaging 2, frame correction 2x2 variants, rounded up) per command buffer
 
 	VkDescriptorPoolCreateInfo poolInfo = {};
 	poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
 	poolInfo.poolSizeCount = 1;
 	poolInfo.pPoolSizes = &poolSize;
-	poolInfo.maxSets = static_cast<uint32_t>(this->impl->numCommandBuffers * 12);  // 12 descriptor sets per command buffer (including merged, universal, FPN, background subtraction, and background recording pipelines)
+	poolInfo.maxSets = static_cast<uint32_t>(this->impl->numCommandBuffers * 18);  // 18 descriptor sets per command buffer (including merged, universal, FPN, background subtraction/recording and the line-field pipelines)
 	poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;  // Allow individual descriptor sets to be freed
 
 	checkVulkanErrors(vkCreateDescriptorPool(this->impl->device, &poolInfo, nullptr, &this->impl->descriptorPool));
@@ -4456,6 +5075,70 @@ void VulkanBackend::createComputePipelines() {
 	checkVulkanErrors(vkCreateComputePipelines(this->impl->device, VK_NULL_HANDLE, 1, &backgroundRecordingPipelineInfo, nullptr, &this->impl->backgroundRecordingPipeline));
 
 	vkDestroyShaderModule(this->impl->device, backgroundRecordingShader, nullptr);
+
+	// ============================================
+	// Line-Field OCT Pipelines
+	// ============================================
+	// Five small pipelines with identical creation steps: N storage buffer bindings,
+	// one push constant range, shader compiled from file (same steps as the pipelines above)
+
+	auto createLineFieldPipeline = [this](const char* shaderFile, uint32_t bindingCount, uint32_t pushConstantSize,
+	                                      VkDescriptorSetLayout& dsLayout, VkPipelineLayout& layout, VkPipeline& pipeline) {
+		std::vector<VkDescriptorSetLayoutBinding> bindings(bindingCount);
+		for (uint32_t b = 0; b < bindingCount; b++) {
+			bindings[b].binding = b;
+			bindings[b].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+			bindings[b].descriptorCount = 1;
+			bindings[b].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+			bindings[b].pImmutableSamplers = nullptr;
+		}
+
+		VkDescriptorSetLayoutCreateInfo layoutInfo = {};
+		layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+		layoutInfo.bindingCount = bindingCount;
+		layoutInfo.pBindings = bindings.data();
+		checkVulkanErrors(vkCreateDescriptorSetLayout(this->impl->device, &layoutInfo, nullptr, &dsLayout));
+
+		VkPushConstantRange pushRange = {};
+		pushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+		pushRange.offset = 0;
+		pushRange.size = pushConstantSize;
+
+		VkPipelineLayoutCreateInfo pipelineLayoutInfo = {};
+		pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+		pipelineLayoutInfo.setLayoutCount = 1;
+		pipelineLayoutInfo.pSetLayouts = &dsLayout;
+		pipelineLayoutInfo.pushConstantRangeCount = 1;
+		pipelineLayoutInfo.pPushConstantRanges = &pushRange;
+		checkVulkanErrors(vkCreatePipelineLayout(this->impl->device, &pipelineLayoutInfo, nullptr, &layout));
+
+		std::string shaderPath = std::string("shaders/") + shaderFile;
+		std::string shaderSource = loadShaderSource(shaderPath);
+		std::vector<uint32_t> spirv = compileGLSLToSPIRV(shaderSource, shaderPath, shaderc_compute_shader);
+		VkShaderModule shaderModule = createShaderModule(this->impl->device, spirv);
+
+		VkComputePipelineCreateInfo pipelineInfo = {};
+		pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+		pipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+		pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+		pipelineInfo.stage.module = shaderModule;
+		pipelineInfo.stage.pName = "main";
+		pipelineInfo.layout = layout;
+		checkVulkanErrors(vkCreateComputePipelines(this->impl->device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &pipeline));
+
+		vkDestroyShaderModule(this->impl->device, shaderModule, nullptr);
+	};
+
+	createLineFieldPipeline("background_frame_update.comp", 3, sizeof(uint32_t) * 8,
+		this->impl->bgFrameUpdateDescriptorSetLayout, this->impl->bgFrameUpdatePipelineLayout, this->impl->bgFrameUpdatePipeline);
+	createLineFieldPipeline("background_frame_smooth.comp", 2, sizeof(uint32_t) * 3,
+		this->impl->bgFrameSmoothDescriptorSetLayout, this->impl->bgFrameSmoothPipelineLayout, this->impl->bgFrameSmoothPipeline);
+	createLineFieldPipeline("background_frame_subtraction.comp", 3, sizeof(uint32_t) * 5,
+		this->impl->bgFrameSubtractionDescriptorSetLayout, this->impl->bgFrameSubtractionPipelineLayout, this->impl->bgFrameSubtractionPipeline);
+	createLineFieldPipeline("average_live_spectra.comp", 2, sizeof(uint32_t) * 2,
+		this->impl->avgSpectraDescriptorSetLayout, this->impl->avgSpectraPipelineLayout, this->impl->avgSpectraPipeline);
+	createLineFieldPipeline("postfft_frame_correction.comp", 2, sizeof(uint32_t) * 3,
+		this->impl->frameCorrectionDescriptorSetLayout, this->impl->frameCorrectionPipelineLayout, this->impl->frameCorrectionPipeline);
 
 	// ============================================
 	// Universal Pre-FFT Processing Shader
@@ -5131,6 +5814,68 @@ void VulkanBackend::createComputePipelines() {
 	}
 
 	// ============================================
+	// Allocate and Update Line-Field OCT Descriptor Sets
+	// ============================================
+
+	auto allocateLineFieldSets = [this](VkDescriptorSetLayout dsLayout, uint32_t count, VkDescriptorSet* sets) {
+		std::vector<VkDescriptorSetLayout> layouts(count, dsLayout);
+		VkDescriptorSetAllocateInfo info = {};
+		info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+		info.descriptorPool = this->impl->descriptorPool;
+		info.descriptorSetCount = count;
+		info.pSetLayouts = layouts.data();
+		checkVulkanErrors(vkAllocateDescriptorSets(this->impl->device, &info, sets));
+	};
+
+	auto writeLineFieldSet = [this](const char* tag, VkDescriptorSet set, const std::vector<VkBuffer>& buffers) {
+		std::vector<VkDescriptorBufferInfo> infos(buffers.size());
+		std::vector<VkWriteDescriptorSet> writes(buffers.size());
+		for (size_t b = 0; b < buffers.size(); ++b) {
+			infos[b].buffer = buffers[b];
+			infos[b].offset = 0;
+			infos[b].range = VK_WHOLE_SIZE;
+			writes[b] = {};
+			writes[b].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+			writes[b].dstSet = set;
+			writes[b].dstBinding = static_cast<uint32_t>(b);
+			writes[b].dstArrayElement = 0;
+			writes[b].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+			writes[b].descriptorCount = 1;
+			writes[b].pBufferInfo = &infos[b];
+		}
+		this->impl->updateDescriptorSetsTagged(tag, static_cast<uint32_t>(writes.size()), writes.data());
+	};
+
+	int numCmdBufs = this->impl->numCommandBuffers;
+	this->impl->bgFrameUpdateDescriptorSets.resize(numCmdBufs);
+	allocateLineFieldSets(this->impl->bgFrameUpdateDescriptorSetLayout, numCmdBufs, this->impl->bgFrameUpdateDescriptorSets.data());
+	this->impl->bgFrameSubtractionDescriptorSets.resize(numCmdBufs);
+	allocateLineFieldSets(this->impl->bgFrameSubtractionDescriptorSetLayout, numCmdBufs, this->impl->bgFrameSubtractionDescriptorSets.data());
+	this->impl->avgSpectraDescriptorSets.resize(numCmdBufs);
+	allocateLineFieldSets(this->impl->avgSpectraDescriptorSetLayout, numCmdBufs, this->impl->avgSpectraDescriptorSets.data());
+	allocateLineFieldSets(this->impl->bgFrameSmoothDescriptorSetLayout, 1, &this->impl->bgFrameSmoothDescriptorSet);
+	this->impl->frameCorrectionDescriptorSets.resize(numCmdBufs);
+	for (int i = 0; i < numCmdBufs; ++i) {
+		allocateLineFieldSets(this->impl->frameCorrectionDescriptorSetLayout, 2, this->impl->frameCorrectionDescriptorSets[i].data());
+	}
+
+	writeLineFieldSet("BgFrameSmooth", this->impl->bgFrameSmoothDescriptorSet,
+		{this->impl->backgroundSmoothedFrameBuffer, this->impl->backgroundFrameBuffer});
+	for (int i = 0; i < numCmdBufs; ++i) {
+		writeLineFieldSet("BgFrameUpdate", this->impl->bgFrameUpdateDescriptorSets[i],
+			{this->impl->deviceFftBuffers[i], this->impl->backgroundAccumulatorBuffer, this->impl->backgroundFrameBuffer});
+		writeLineFieldSet("BgFrameSubtraction", this->impl->bgFrameSubtractionDescriptorSets[i],
+			{this->impl->deviceFftBuffers[i], this->impl->backgroundFrameBuffer, this->impl->backgroundSmoothedFrameBuffer});
+		writeLineFieldSet("AvgSpectra", this->impl->avgSpectraDescriptorSets[i],
+			{this->impl->deviceFftBuffers[i], this->impl->liveSpectralAveragesBuffers[i]});
+		// Frame correction runs post-FFT: variant 0 reads the FFT buffer, variant 1 the intermediate buffer
+		writeLineFieldSet("FrameCorrection", this->impl->frameCorrectionDescriptorSets[i][0],
+			{this->impl->deviceFftBuffers[i], this->impl->liveSpectralAveragesBuffers[i]});
+		writeLineFieldSet("FrameCorrection", this->impl->frameCorrectionDescriptorSets[i][1],
+			{this->impl->deviceIntermediateBuffers[i], this->impl->liveSpectralAveragesBuffers[i]});
+	}
+
+	// ============================================
 	// Validate Pipeline Creation
 	// ============================================
 
@@ -5233,6 +5978,32 @@ void VulkanBackend::destroyComputePipelines() {
 		vkDestroyPipelineLayout(this->impl->device, this->impl->backgroundRecordingPipelineLayout, nullptr);
 		this->impl->backgroundRecordingPipelineLayout = VK_NULL_HANDLE;
 	}
+
+	// Destroy line-field OCT pipeline resources
+	auto destroyLineFieldPipeline = [this](VkPipeline& pipeline, VkDescriptorSetLayout& dsLayout, VkPipelineLayout& layout) {
+		if (pipeline != VK_NULL_HANDLE) {
+			vkDestroyPipeline(this->impl->device, pipeline, nullptr);
+			pipeline = VK_NULL_HANDLE;
+		}
+		if (dsLayout != VK_NULL_HANDLE) {
+			vkDestroyDescriptorSetLayout(this->impl->device, dsLayout, nullptr);
+			dsLayout = VK_NULL_HANDLE;
+		}
+		if (layout != VK_NULL_HANDLE) {
+			vkDestroyPipelineLayout(this->impl->device, layout, nullptr);
+			layout = VK_NULL_HANDLE;
+		}
+	};
+	destroyLineFieldPipeline(this->impl->bgFrameUpdatePipeline, this->impl->bgFrameUpdateDescriptorSetLayout, this->impl->bgFrameUpdatePipelineLayout);
+	destroyLineFieldPipeline(this->impl->bgFrameSmoothPipeline, this->impl->bgFrameSmoothDescriptorSetLayout, this->impl->bgFrameSmoothPipelineLayout);
+	destroyLineFieldPipeline(this->impl->bgFrameSubtractionPipeline, this->impl->bgFrameSubtractionDescriptorSetLayout, this->impl->bgFrameSubtractionPipelineLayout);
+	destroyLineFieldPipeline(this->impl->avgSpectraPipeline, this->impl->avgSpectraDescriptorSetLayout, this->impl->avgSpectraPipelineLayout);
+	destroyLineFieldPipeline(this->impl->frameCorrectionPipeline, this->impl->frameCorrectionDescriptorSetLayout, this->impl->frameCorrectionPipelineLayout);
+	this->impl->bgFrameUpdateDescriptorSets.clear();
+	this->impl->bgFrameSubtractionDescriptorSets.clear();
+	this->impl->avgSpectraDescriptorSets.clear();
+	this->impl->frameCorrectionDescriptorSets.clear();
+	this->impl->bgFrameSmoothDescriptorSet = VK_NULL_HANDLE;
 
 	// Destroy universal pre-FFT pipeline resources
 	for (int i = 0; i < 6; ++i) {

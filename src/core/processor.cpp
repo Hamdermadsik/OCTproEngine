@@ -291,9 +291,10 @@ public:
 	}
 
 	// Line-field OCT features (background frame subtraction, post-FFT frame correction)
-	// are currently implemented in the CPU, CUDA and OpenCL backends
+	// are implemented in all backends
 	static bool backendSupportsLineFieldFeatures(Backend type) {
-		return type == Backend::CPU || type == Backend::CUDA || type == Backend::OPENCL;
+		(void)type;
+		return true;
 	}
 
 	static void throwIfLineFieldUnsupported(Backend type) {

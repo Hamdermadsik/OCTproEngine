@@ -1,0 +1,55 @@
+#version 450
+
+// Live Spectral Averaging Shader (Line-Field OCT)
+// Averages each A-scan's raw spectrum to a single value for post-FFT frame
+// correction. Must run before background subtraction removes the DC content.
+// One workgroup per A-scan with strided reads and a shared-memory reduction.
+
+layout(local_size_x = WORKGROUP_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+// ============================================
+// Descriptor Bindings
+// ============================================
+layout(binding = 0) buffer InputBuffer {
+	vec2 data[];  // Complex spectra after input conversion (pre-FFT)
+} inputBuf;
+
+layout(binding = 1) buffer AveragesBuffer {
+	float data[];  // Output: one average per A-scan (size: ascansPerBuffer)
+} averagesBuf;
+
+// ============================================
+// Push Constants
+// ============================================
+layout(push_constant) uniform PushConstants {
+	uint samplesPerLine;
+	uint ascansPerBuffer;
+} params;
+
+shared float scratch[WORKGROUP_SIZE];
+
+void main() {
+	uint ascanIndex = gl_WorkGroupID.x;
+	uint lid = gl_LocalInvocationID.x;
+	if (ascanIndex >= params.ascansPerBuffer) {
+		return;
+	}
+
+	float sum = 0.0f;
+	for (uint s = lid; s < params.samplesPerLine; s += WORKGROUP_SIZE) {
+		sum += inputBuf.data[ascanIndex * params.samplesPerLine + s].x;
+	}
+	scratch[lid] = sum;
+	barrier();
+
+	// Tree reduction of the partial sums (WORKGROUP_SIZE is a power of two)
+	for (uint offset = WORKGROUP_SIZE / 2; offset > 0; offset >>= 1) {
+		if (lid < offset) {
+			scratch[lid] += scratch[lid + offset];
+		}
+		barrier();
+	}
+	if (lid == 0) {
+		averagesBuf.data[ascanIndex] = scratch[0] / float(params.samplesPerLine);
+	}
+}

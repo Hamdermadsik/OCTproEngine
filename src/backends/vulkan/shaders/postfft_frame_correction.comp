@@ -1,0 +1,41 @@
+#version 450
+
+// Post-FFT Frame Correction Shader (Line-Field OCT)
+// Divides each A-scan by the square root of its pre-subtraction spectral
+// average (lateral flat-field correction). Runs after the IFFT and before
+// fixed-pattern noise determination.
+
+layout(local_size_x = WORKGROUP_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+// ============================================
+// Descriptor Bindings
+// ============================================
+layout(binding = 0) buffer DataBuffer {
+	vec2 data[];  // Complex post-IFFT data (in-place processing)
+} dataBuf;
+
+layout(binding = 1) buffer AveragesBuffer {
+	float data[];  // One pre-subtraction spectral average per A-scan
+} averagesBuf;
+
+// ============================================
+// Push Constants
+// ============================================
+layout(push_constant) uniform PushConstants {
+	uint samplesPerLine;
+	uint samplesPerBuffer;
+	float normalizationScale;  // sqrt(2^bitDepth)
+} params;
+
+void main() {
+	uint index = gl_GlobalInvocationID.x;
+	if (index >= params.samplesPerBuffer) {
+		return;
+	}
+
+	uint ascanIndex = index / params.samplesPerLine;
+	float rootAverage = sqrt(averagesBuf.data[ascanIndex]);
+	if (rootAverage > 1.0f) {
+		dataBuf.data[index] *= params.normalizationScale / rootAverage;
+	}
+}

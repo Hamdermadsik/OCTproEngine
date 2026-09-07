@@ -1,0 +1,53 @@
+#version 450
+
+// Background Frame Subtraction Shader (Line-Field OCT)
+// Subtracts the background B-scan from the raw spectra in place (before the FFT),
+// optionally normalizing by the square root of the background
+
+layout(local_size_x = WORKGROUP_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+// ============================================
+// Descriptor Bindings
+// ============================================
+layout(binding = 0) buffer DataBuffer {
+	vec2 data[];  // Complex spectra (in-place processing)
+} dataBuf;
+
+layout(binding = 1) buffer BackgroundFrameBuffer {
+	float data[];  // Background frame (size: samplesPerBscan)
+} frameBuf;
+
+layout(binding = 2) buffer SmoothedFrameBuffer {
+	float data[];  // Smoothed background frame (size: samplesPerBscan)
+} smoothedBuf;
+
+// ============================================
+// Push Constants (baked at record time)
+// ============================================
+layout(push_constant) uniform PushConstants {
+	uint samplesPerBscan;
+	uint samplesPerBuffer;
+	uint normalize;            // 1 = divide by sqrt(background)
+	uint useSmoothed;          // 1 = read the smoothed frame instead of the raw one
+	float normalizationScale;  // sqrt(2^bitDepth)
+} params;
+
+void main() {
+	uint index = gl_GlobalInvocationID.x;
+	if (index >= params.samplesPerBuffer) {
+		return;
+	}
+
+	uint posInBscan = index % params.samplesPerBscan;
+	float backgroundValue = (params.useSmoothed != 0)
+		? smoothedBuf.data[posInBscan]
+		: frameBuf.data[posInBscan];
+	float inputValue = dataBuf.data[index].x - backgroundValue;
+	if (params.normalize != 0) {
+		backgroundValue = sqrt(backgroundValue);
+		if (backgroundValue > 1.0f) {
+			inputValue = params.normalizationScale * (inputValue / backgroundValue);
+		}
+	}
+	dataBuf.data[index] = vec2(inputValue, 0.0f);
+}

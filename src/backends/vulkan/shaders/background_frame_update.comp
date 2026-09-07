@@ -1,0 +1,68 @@
+#version 450
+
+// Background Frame Update Shader (Line-Field OCT)
+// Per-buffer update of the shared background frame: recording accumulation,
+// recording finalization and continuous EMA update. Each thread owns one
+// background sample, so the sub-steps execute in order without extra barriers.
+// The mode values are baked as push constants when the command buffers are
+// recorded; boundary buffers (recording start/completion, EMA bootstrap)
+// trigger a re-record.
+
+layout(local_size_x = WORKGROUP_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+// ============================================
+// Descriptor Bindings
+// ============================================
+layout(binding = 0) buffer InputBuffer {
+	vec2 data[];  // Complex spectra after input conversion (pre-FFT)
+} inputBuf;
+
+layout(binding = 1) buffer AccumulatorBuffer {
+	float data[];  // Recording accumulator (size: samplesPerBscan)
+} accumulatorBuf;
+
+layout(binding = 2) buffer BackgroundFrameBuffer {
+	float data[];  // Background frame (size: samplesPerBscan)
+} frameBuf;
+
+// ============================================
+// Push Constants (baked at record time)
+// ============================================
+layout(push_constant) uniform PushConstants {
+	uint samplesPerBscan;
+	uint bscansToAccumulate;   // 0 = no recording accumulation
+	uint finalizeRecording;    // 1 = write accumulator * normFactor into the frame
+	float finalizeNormFactor;
+	uint runEma;               // 1 = fold all B-scans of the buffer into the frame
+	float emaAlpha;
+	uint zeroFrameFirst;       // 1 = EMA bootstrap: start from a zeroed frame
+	uint bscansInBuffer;
+} params;
+
+void main() {
+	uint index = gl_GlobalInvocationID.x;
+	if (index >= params.samplesPerBscan) {
+		return;
+	}
+
+	if (params.bscansToAccumulate > 0) {
+		float sum = 0.0f;
+		for (uint b = 0; b < params.bscansToAccumulate; b++) {
+			sum += inputBuf.data[index + b * params.samplesPerBscan].x;
+		}
+		accumulatorBuf.data[index] += sum;
+	}
+
+	if (params.finalizeRecording != 0) {
+		frameBuf.data[index] = accumulatorBuf.data[index] * params.finalizeNormFactor;
+	}
+
+	if (params.runEma != 0) {
+		float bg = (params.zeroFrameFirst != 0) ? 0.0f : frameBuf.data[index];
+		for (uint b = 0; b < params.bscansInBuffer; b++) {
+			float newValue = inputBuf.data[b * params.samplesPerBscan + index].x;
+			bg = params.emaAlpha * newValue + (1.0f - params.emaAlpha) * bg;
+		}
+		frameBuf.data[index] = bg;
+	}
+}

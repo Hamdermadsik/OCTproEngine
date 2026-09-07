@@ -695,66 +695,23 @@ void testBackendSwitchTransfer() {
 	}
 }
 
-// Enabling on a backend without line-field support must throw without changing
-// configuration (Vulkan is the remaining unsupported backend)
-void testUnsupportedBackendRejection() {
-	std::cout << "  Unsupported backend rejection (Vulkan)..." << std::endl;
-	if (!ope::BackendUtils::isVulkanAvailable()) {
-		std::cout << "    [SKIPPED] no Vulkan runtime available" << std::endl;
-		return;
-	}
+// All backends support the line-field features now; enabling must never throw and the
+// passive pre-initialization profile handling must still work everywhere
 
-	ope::Processor processor(ope::Backend::VULKAN);
-	bool threw = false;
-	try {
-		processor.enableBackgroundFrameSubtraction(true);
-	} catch (const std::runtime_error&) {
-		threw = true;
-	}
-	TEST_ASSERT(threw, "Enabling background frame subtraction on Vulkan must throw");
-	TEST_ASSERT(!processor.getConfig().processingParams.backgroundFrame.enabled,
-		"Rejected enable must not change the configuration");
+// Profile set and reset must work on an uninitialized processor on every backend
+void testResetBeforeInitialization() {
+	std::cout << "  Profile set/reset before initialization..." << std::endl;
 
-	bool threwCorrection = false;
-	try {
-		processor.enablePostFftFrameCorrection(true);
-	} catch (const std::runtime_error&) {
-		threwCorrection = true;
-	}
-	TEST_ASSERT(threwCorrection, "Enabling frame correction on Vulkan must throw");
-}
-
-// Reset must work on passive backends, and a rejected backend switch must leave
-// backend and stored backend configuration consistent
-void testResetAndRejectedSwitchConsistency() {
-	std::cout << "  Reset on passive backends and rejected setBackendConfig()..." << std::endl;
-
-	ope::Processor processor(ope::Backend::CPU);
-	configurePassthrough(processor, 1);
-	processor.enableBackgroundFrameSubtraction(true);
-	bool threw = false;
-	try {
-		processor.setBackendConfig(ope::VulkanConfig());
-	} catch (const std::runtime_error&) {
-		threw = true;
-	}
-	TEST_ASSERT(threw, "setBackendConfig() to an unsupported backend must throw");
-	TEST_ASSERT(processor.getBackend() == ope::Backend::CPU, "Backend must remain CPU");
-	auto backendConfig = processor.getBackendConfig();
-	TEST_ASSERT(backendConfig && backendConfig->getBackendType() == ope::Backend::CPU,
-		"Stored backend configuration must match the actual backend");
-
-	// Passive profile storage and reset work without processing support
 	if (ope::BackendUtils::isOpenCLAvailable()) {
-		ope::Processor passive(ope::Backend::OPENCL);
-		passive.setInputParameters(SIGNAL_LENGTH, ASCANS_PER_BSCAN, 1, ope::DataType::UINT16);
+		ope::Processor processor(ope::Backend::OPENCL);
+		processor.setInputParameters(SIGNAL_LENGTH, ASCANS_PER_BSCAN, 1, ope::DataType::UINT16);
 		std::vector<float> frame(SAMPLES_PER_BSCAN, 5.0f);
-		passive.setBackgroundFrameProfile(frame.data(), SIGNAL_LENGTH, ASCANS_PER_BSCAN);
-		TEST_ASSERT(passive.hasBackgroundFrameProfile(), "Passive profile must be stored");
-		passive.resetBackgroundFrame();
-		TEST_ASSERT(!passive.hasBackgroundFrameProfile(), "Reset must clear the passive profile");
+		processor.setBackgroundFrameProfile(frame.data(), SIGNAL_LENGTH, ASCANS_PER_BSCAN);
+		TEST_ASSERT(processor.hasBackgroundFrameProfile(), "Profile must be stored before initialization");
+		processor.resetBackgroundFrame();
+		TEST_ASSERT(!processor.hasBackgroundFrameProfile(), "Reset must clear the profile before initialization");
 	} else {
-		std::cout << "    [SKIPPED] passive reset: no OpenCL runtime available" << std::endl;
+		std::cout << "    [SKIPPED] no OpenCL runtime available" << std::endl;
 	}
 }
 
@@ -960,11 +917,16 @@ int main() {
 			std::cout << "  [SKIPPED] OpenCL suite: no OpenCL runtime available" << std::endl;
 		}
 
+		if (ope::BackendUtils::isVulkanAvailable()) {
+			runBackendSuite(ope::Backend::VULKAN, "Vulkan");
+		} else {
+			std::cout << "  [SKIPPED] Vulkan suite: no Vulkan runtime available" << std::endl;
+		}
+
 		std::cout << "\n=== Cross-backend ===" << std::endl;
 		testValidationRejection();
 		testBackendSwitchTransfer();
-		testUnsupportedBackendRejection();
-		testResetAndRejectedSwitchConsistency();
+		testResetBeforeInitialization();
 		testFailedSwitchKeepsAccurateMetadata();
 		testFailedSwitchKeepsCalibrationRecoverable();
 		testRecordedProfilesExportAfterSwitch();
@@ -973,6 +935,9 @@ int main() {
 		}
 		if (ope::BackendUtils::isOpenCLAvailable()) {
 			testSequenceMatchesCpu(ope::Backend::OPENCL, "OpenCL");
+		}
+		if (ope::BackendUtils::isVulkanAvailable()) {
+			testSequenceMatchesCpu(ope::Backend::VULKAN, "Vulkan");
 		}
 
 		std::cout << "\nAll background frame tests passed" << std::endl;

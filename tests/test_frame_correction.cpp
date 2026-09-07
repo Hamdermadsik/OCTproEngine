@@ -162,6 +162,12 @@ int main() {
 			std::cout << "  [SKIPPED] OpenCL suite: no OpenCL runtime available" << std::endl;
 		}
 
+		if (ope::BackendUtils::isVulkanAvailable()) {
+			runBackendSuite(ope::Backend::VULKAN, "Vulkan");
+		} else {
+			std::cout << "  [SKIPPED] Vulkan suite: no Vulkan runtime available" << std::endl;
+		}
+
 		std::cout << "\nAll frame correction tests passed" << std::endl;
 		return 0;
 	} catch (const std::exception& e) {
