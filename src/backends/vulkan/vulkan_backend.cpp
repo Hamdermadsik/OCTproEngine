@@ -2895,6 +2895,10 @@ void VulkanBackend::updateConfig(const ProcessorConfiguration& config) {
 
 	bool fftParamsChanged = (newKey != this->impl->prevFftKey);
 
+	// Snapshot the smoothing-relevant settings before the configuration is replaced
+	const ProcessorConfiguration::ProcessingParameters::BackgroundFrame oldBf =
+		this->impl->config.processingParams.backgroundFrame;
+
 	// === STEP 2: Update impl->config ===
 	this->impl->config = config;
 
@@ -2971,10 +2975,15 @@ void VulkanBackend::updateConfig(const ProcessorConfiguration& config) {
 
 	// Line-field OCT: smoothing settings changes and leaving continuous mode need the
 	// static smoothed cache refreshed from the live frame (the recorded in-stage
-	// smoothing pass no longer runs in the static regime)
+	// smoothing pass no longer runs in the static regime). Unrelated settings changes
+	// must not pay for a device drain and rebuild
 	const ProcessorConfiguration::ProcessingParameters::BackgroundFrame& newBf =
 		config.processingParams.backgroundFrame;
-	if (this->impl->vulkanInitialized && this->impl->backgroundFrameValid &&
+	bool smoothingTransition = oldBf.enabled != newBf.enabled ||
+		oldBf.smoothSpectra != newBf.smoothSpectra ||
+		oldBf.smoothingWindowRadius != newBf.smoothingWindowRadius ||
+		oldBf.continuousUpdate != newBf.continuousUpdate;
+	if (smoothingTransition && this->impl->vulkanInitialized && this->impl->backgroundFrameValid &&
 		newBf.enabled && newBf.smoothSpectra && !newBf.continuousUpdate &&
 		!this->impl->backgroundRecordingInProgress) {
 		std::lock_guard<std::mutex> submitLock(this->impl->submitMutex);
