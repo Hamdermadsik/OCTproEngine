@@ -880,6 +880,74 @@ void testSequenceMatchesCpu(ope::Backend backend, const char* name) {
 	}
 }
 
+// Recording with smoothing while buffers are still in flight: buffers submitted
+// back-to-back behind the finalizing one must subtract the freshly recorded frame,
+// never a smoothed copy of the pre-recording background. Uses large buffers so
+// processing genuinely overlaps the recording completion
+void testRecordingWithSmoothingInFlight(ope::Backend backend) {
+	std::cout << "  Recording with smoothing while buffers are in flight..." << std::endl;
+
+	const int signalLength = 2048;
+	const int ascans = 512;
+	const size_t samplesPerBscan = static_cast<size_t>(signalLength) * ascans;
+	const int numBuffers = 3;
+
+	ope::Processor processor(backend);
+	processor.setInputParameters(signalLength, ascans, 1, ope::DataType::UINT16);
+	processor.enableLogScaling(false);
+	processor.setGrayscaleRange(0.0f, 1.0f);
+	processor.setSignalMultiplicatorAndAddend(1.0f, 0.0f);
+	processor.setBackgroundFrameBscansToAverage(1);
+	processor.initialize();
+
+	std::vector<float> oldBackground(samplesPerBscan, 10.0f);
+	processor.setBackgroundFrameProfile(oldBackground.data(), signalLength, ascans);
+	processor.enableBackgroundFrameSubtraction(true);
+	processor.setBackgroundFrameSmoothing(true, 1);
+
+	std::vector<float> maxAbs(numBuffers, -1.0f);
+	std::atomic<int> received{0};
+	int callbackId = processor.addOutputCallback([&](const ope::IOBuffer& buf) {
+		const float* data = static_cast<const float*>(buf.getDataPointer());
+		size_t outputSamples = samplesPerBscan / 2;
+		float maxValue = 0.0f;
+		for (size_t i = 0; i < outputSamples; ++i) {
+			maxValue = std::max(maxValue, std::abs(data[i]));
+		}
+		maxAbs[received] = maxValue;
+		received++;
+	});
+
+	processor.requestBackgroundFrameRecording();
+
+	// Submit all buffers back-to-back WITHOUT waiting, so the recording completes
+	// while later buffers are already in flight
+	std::vector<uint16_t> input(samplesPerBscan, 300);
+	for (int n = 0; n < numBuffers; ++n) {
+		auto& buffer = processor.getNextAvailableInputBuffer();
+		memcpy(buffer.getDataPointer(), input.data(), input.size() * sizeof(uint16_t));
+		processor.process(buffer);
+	}
+
+	auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+	while (received < numBuffers) {
+		TEST_ASSERT(std::chrono::steady_clock::now() < deadline, "Timed out waiting for output delivery");
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	}
+	processor.removeOutputCallback(callbackId);
+
+	// Buffer 0 records 300 and already subtracts it; every buffer must come out ~0
+	for (int n = 0; n < numBuffers; ++n) {
+		TEST_ASSERT(maxAbs[n] <= 0.5f,
+			"Buffer " + std::to_string(n) + " must subtract the freshly recorded background, not a stale smoothed copy (max " +
+			std::to_string(maxAbs[n]) + ")");
+	}
+
+	std::vector<float> profile = processor.getBackgroundFrameProfile();
+	TEST_ASSERT(!profile.empty() && nearlyEqual(profile[0], 300.0f, 0.01f),
+		"The recorded profile must be the new frame (300)");
+}
+
 void runBackendSuite(ope::Backend backend, const char* name) {
 	std::cout << "\n=== Backend: " << name << " ===" << std::endl;
 	testRecording(backend);
@@ -896,6 +964,7 @@ void runBackendSuite(ope::Backend backend, const char* name) {
 	testSetInputParametersPreservesFrame(backend);
 	testProfileOriginalsSurviveResize(backend);
 	testCalibrationSurvivesReinitRoundTrips(backend);
+	testRecordingWithSmoothingInFlight(backend);
 }
 
 int main() {

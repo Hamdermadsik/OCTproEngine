@@ -2673,7 +2673,12 @@ void VulkanBackend::process(IOBuffer& input) {
 		this->impl->backgroundBscansToProcessBake = 0;
 		this->impl->backgroundRecordingInProgress = false;
 		this->impl->backgroundFrameValid = true;
-		this->impl->smoothedFrameDirty = true;
+		// The finalize buffer's in-stage smoothing pass already rebuilt the smoothed frame
+		// on-GPU from the freshly recorded frame; a host-mirror refresh here would overwrite
+		// it with the stale pre-recording profile
+		const ProcessorConfiguration::ProcessingParameters::BackgroundFrame& finalizedBf =
+			this->impl->config.processingParams.backgroundFrame;
+		this->impl->smoothedFrameDirty = !(finalizedBf.enabled && finalizedBf.smoothSpectra);
 		// The completion thread reads the finalized frame at this buffer's timeline value
 		this->impl->backgroundFinalizeSignalValue.store(this->impl->nextOutputSignalValue, std::memory_order_release);
 		this->impl->needRerecordAfterBgCapture.store(true, std::memory_order_release);
