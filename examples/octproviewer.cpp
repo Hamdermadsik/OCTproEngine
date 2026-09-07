@@ -134,8 +134,30 @@ struct AppState {
 // Utility Functions
 // ============================================================================
 
-// Loads a resampling curve from CSV. Accepts the OCTproEngine format ("index,value"
-// rows with optional '#' comment lines) as well as a plain one-value-per-line file.
+// Loads a resampling curve from CSV.
+// Accepts comma- or semicolon-separated files (Excel exports often use ';'),
+// with or without a header row, and with either "index,value" columns or a
+// single value column. Rows that are not fully numeric are rejected rather
+// than partially parsed, so a wrong delimiter fails loudly instead of
+// silently loading the index column as the curve.
+static bool parseFullFloat(const std::string& text, float& value) {
+	// Trim surrounding whitespace and any trailing '\r' from CRLF files
+	size_t b = text.find_first_not_of(" \t\r\n");
+	if (b == std::string::npos) return false;
+	size_t e = text.find_last_not_of(" \t\r\n");
+	std::string trimmed = text.substr(b, e - b + 1);
+
+	try {
+		size_t consumed = 0;
+		float parsed = std::stof(trimmed, &consumed);
+		if (consumed != trimmed.size()) return false;  // trailing junk -> reject
+		value = parsed;
+		return true;
+	} catch (const std::exception&) {
+		return false;
+	}
+}
+
 bool loadResamplingLutCsv(const char* path, std::vector<float>& out, std::string& status) {
 	out.clear();
 	std::ifstream file(path);
@@ -144,27 +166,57 @@ bool loadResamplingLutCsv(const char* path, std::vector<float>& out, std::string
 		return false;
 	}
 
+	std::vector<std::string> lines;
 	std::string line;
 	while (std::getline(file, line)) {
 		if (line.empty() || line[0] == '#') continue;
+		if (line.find_first_not_of(" \t\r\n") == std::string::npos) continue;
+		lines.push_back(line);
+	}
 
-		std::string first, second;
-		std::istringstream iss(line);
-		std::getline(iss, first, ',');
-		bool hasSecond = static_cast<bool>(std::getline(iss, second, ','));
+	if (lines.empty()) {
+		status = "No data rows found in file";
+		return false;
+	}
+
+	// Detect the delimiter from the first data row
+	char delimiter = ',';
+	if (lines[0].find(',') == std::string::npos && lines[0].find(';') != std::string::npos) {
+		delimiter = ';';
+	}
+
+	size_t rejected = 0;
+	for (size_t i = 0; i < lines.size(); ++i) {
+		std::vector<std::string> fields;
+		std::istringstream iss(lines[i]);
+		std::string field;
+		while (std::getline(iss, field, delimiter)) {
+			fields.push_back(field);
+		}
+		if (fields.empty()) continue;
 
 		// Value is the second column when present, otherwise the only column
-		const std::string& field = hasSecond ? second : first;
-		try {
-			out.push_back(std::stof(field));
-		} catch (const std::exception&) {
-			continue;  // skips the "index,value" header and any malformed row
+		const std::string& valueField = (fields.size() >= 2) ? fields[1] : fields[0];
+
+		float value = 0.0f;
+		if (parseFullFloat(valueField, value)) {
+			out.push_back(value);
+		} else {
+			++rejected;  // header row or malformed line
 		}
 	}
 
 	if (out.empty()) {
-		status = "No values found in file";
+		status = "No numeric values found - check delimiter and columns";
 		return false;
+	}
+
+	// A single rejected row is almost always the header. More than that means
+	// the file is not being read the way the user expects.
+	if (rejected > 1) {
+		status = "Loaded " + std::to_string(out.size()) + " values, but skipped " +
+		         std::to_string(rejected) + " unparseable rows - check the file format";
+		return true;
 	}
 
 	status = "Loaded " + std::to_string(out.size()) + " values";
