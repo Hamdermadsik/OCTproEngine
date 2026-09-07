@@ -1575,6 +1575,12 @@ int VulkanBackend::getCurrentDeviceId() const {
 // ============================================
 
 void VulkanBackend::initialize(const ProcessorConfiguration& config) {
+	// Reset the lifecycle guards: after a cleanup() + initialize() cycle (reinitialization)
+	// the destructor's cleanup() must run again - a stale cleanupDone guard would skip the
+	// teardown and leave the new completion thread unjoined (std::terminate)
+	this->impl->cleanupDone.store(false, std::memory_order_release);
+	this->impl->shuttingDown.store(false, std::memory_order_release);
+
 	// Store configuration
 	this->impl->config = config;
 
@@ -3372,7 +3378,7 @@ void VulkanBackend::allocateDeviceBuffers() {
 	this->impl->stagingOutputBuffers.resize(actualNumOutputBuffers);
 	this->impl->stagingOutputMemory.resize(actualNumOutputBuffers);
 	this->impl->stagingOutputMapped.resize(actualNumOutputBuffers);
-	this->impl->stagingLastWriteValue.resize(actualNumOutputBuffers, 0);  // Initialize to 0 (no previous write)
+	this->impl->stagingLastWriteValue.assign(actualNumOutputBuffers, 0);  // Initialize to 0 (no previous write; assign() also clears stale values on reinitialization)
 	this->impl->stagingOutputAllocSize.resize(actualNumOutputBuffers);  // Track allocation size for alignment capping
 
 	// Initialize stagingInUse atomic bools (unique_ptr array because atomics can't go in vector)
@@ -3790,7 +3796,7 @@ void VulkanBackend::createCommandBuffersAndFences() {
 	this->impl->nextOutputSignalValue = 1;
 
 	// Initialize per-CB timeline tracking (0 means no previous frame used this CB)
-	this->impl->lastTimelineValuePerCB.resize(this->impl->numCommandBuffers, 0);
+	this->impl->lastTimelineValuePerCB.assign(this->impl->numCommandBuffers, 0);  // assign() also clears stale values on reinitialization (a stale wait value would deadlock the H2D submit)
 
 	// Name command buffers and semaphores for debug identification
 	for (int i = 0; i < this->impl->numCommandBuffers; ++i) {
