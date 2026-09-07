@@ -906,12 +906,18 @@ void testRecordingWithSmoothingInFlight(ope::Backend backend) {
 	processor.setBackgroundFrameSmoothing(true, 1);
 
 	std::vector<float> maxAbs(numBuffers, -1.0f);
+	std::atomic<bool> sawNonFinite{false};
 	std::atomic<int> received{0};
 	int callbackId = processor.addOutputCallback([&](const ope::IOBuffer& buf) {
 		const float* data = static_cast<const float*>(buf.getDataPointer());
 		size_t outputSamples = samplesPerBscan / 2;
 		float maxValue = 0.0f;
 		for (size_t i = 0; i < outputSamples; ++i) {
+			// std::max ignores a NaN second argument, so non-finite output must be
+			// detected explicitly - it would otherwise pass as "max 0"
+			if (!std::isfinite(data[i])) {
+				sawNonFinite = true;
+			}
 			maxValue = std::max(maxValue, std::abs(data[i]));
 		}
 		maxAbs[received] = maxValue;
@@ -935,6 +941,8 @@ void testRecordingWithSmoothingInFlight(ope::Backend backend) {
 		std::this_thread::sleep_for(std::chrono::milliseconds(1));
 	}
 	processor.removeOutputCallback(callbackId);
+
+	TEST_ASSERT(!sawNonFinite.load(), "Output must not contain NaN or infinity");
 
 	// Buffer 0 records 300 and already subtracts it; every buffer must come out ~0
 	for (int n = 0; n < numBuffers; ++n) {
