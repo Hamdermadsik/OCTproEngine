@@ -2873,10 +2873,10 @@ void VulkanBackend::process(IOBuffer& input) {
 		std::memcpy(this->impl->recordedBackgroundFrame.data(),
 		            this->impl->backgroundFrameStagingMapped,
 		            samplesPerBscan * sizeof(float));
-
-		// Sync to configuration so the profile survives backend switches
-		this->impl->config.setBackgroundFrameProfile(
-			this->impl->recordedBackgroundFrame, this->impl->signalLength, this->impl->ascansPerBscan);
+		// No configuration sync here: it would race with the completion thread's legacy
+		// recording publications (their setters share adjustAllCurves()), and the processor
+		// pulls the live frame through getBackgroundFrameProfile() whenever it saves,
+		// switches backends or preserves calibration
 	}
 }
 
