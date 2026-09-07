@@ -3,7 +3,7 @@ Background frame subtraction and post-FFT frame correction tests (line-field OCT
 
 Covers: recording, static subtraction, EMA update, 2D NumPy profile round trip,
 raw file save/load, reset, and post-FFT frame correction on the CPU backend
-(the C++ test suite covers CUDA and cross-backend comparison in depth).
+(the C++ test suite covers the GPU backends and cross-backend comparison in depth).
 """
 
 import os
@@ -183,23 +183,6 @@ def test_config_copy_and_type_change():
     print("  PASSED")
 
 
-def test_unsupported_backend():
-    print("Test: enabling on OpenCL backend must throw...")
-    try:
-        proc = ope.Processor(ope.Backend.OPENCL)
-    except Exception as e:
-        print(f"  SKIPPED (OpenCL not available: {e})")
-        return
-    try:
-        proc.enable_background_frame_subtraction(True)
-        assert False, "Enabling on OpenCL must raise"
-    except AssertionError:
-        raise
-    except Exception:
-        pass
-    print("  PASSED")
-
-
 def main():
     print("=" * 60)
     print("Background Frame / Frame Correction Tests (Line-Field OCT)")
@@ -209,7 +192,6 @@ def main():
     test_continuous_ema()
     test_frame_correction()
     test_config_copy_and_type_change()
-    test_unsupported_backend()
     print()
     print("All tests PASSED")
     return 0

@@ -63,7 +63,7 @@ struct ProcessingParams {
 	int fpnBscanCount = 1;
 	bool fpnContinuous = false;
 
-	// Line-field OCT (CPU and CUDA backends only). Continuous EMA update is intentionally
+	// Line-field OCT. Continuous EMA update is intentionally
 	// not exposed here: on a looped cached buffer it converges the image to zero
 	bool backgroundFrameSubtraction = false;
 	bool backgroundFrameNormalize = false;
@@ -251,16 +251,11 @@ void applyProcessingParams(ope::Processor* proc, const ProcessingParams& params)
 	proc->setFixedPatternNoiseBscanCount(params.fpnBscanCount);
 	proc->enableContinuousFixedPatternNoiseDetermination(params.fpnContinuous);
 
-	// Line-field OCT features throw when enabled on unsupported backends
-	bool lineFieldSupported = (proc->getBackend() == ope::Backend::CPU ||
-	                           proc->getBackend() == ope::Backend::CUDA);
-	if (lineFieldSupported) {
-		proc->setBackgroundFrameBscansToAverage(params.backgroundFrameBscansToAverage);
-		proc->setBackgroundFrameSmoothing(params.backgroundFrameSmoothing, params.backgroundFrameSmoothingRadius);
-		proc->enableBackgroundFrameNormalization(params.backgroundFrameNormalize);
-		proc->enableBackgroundFrameSubtraction(params.backgroundFrameSubtraction);
-		proc->enablePostFftFrameCorrection(params.postFftFrameCorrection);
-	}
+	proc->setBackgroundFrameBscansToAverage(params.backgroundFrameBscansToAverage);
+	proc->setBackgroundFrameSmoothing(params.backgroundFrameSmoothing, params.backgroundFrameSmoothingRadius);
+	proc->enableBackgroundFrameNormalization(params.backgroundFrameNormalize);
+	proc->enableBackgroundFrameSubtraction(params.backgroundFrameSubtraction);
+	proc->enablePostFftFrameCorrection(params.postFftFrameCorrection);
 }
 
 void initializeProcessor(AppState* state) {
@@ -747,11 +742,7 @@ void renderProcessingUI(AppState* state) {
 
 	// Background Frame Subtraction (line-field OCT)
 	ImGui::SeparatorText("Background B-scan Subtraction (Line-Field)");
-	bool lineFieldSupported = (state->dataParams.backend == ope::Backend::CPU ||
-	                           state->dataParams.backend == ope::Backend::CUDA);
-	if (!lineFieldSupported) {
-		ImGui::TextDisabled("Only supported on CPU and CUDA backends");
-	} else {
+	{
 		CheckboxWithReprocess("Enable B-scan Subtraction", &pp.backgroundFrameSubtraction, state);
 		ItemTooltip("Subtract a recorded B-scan background from the raw data before the FFT.");
 

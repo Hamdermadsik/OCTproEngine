@@ -397,7 +397,7 @@ void register_processor(py::module& m) {
 
 			.def("enable_background_frame_subtraction", [](ProcessorWrapper& self, bool enable) {
 				self.processor.enableBackgroundFrameSubtraction(enable);
-			}, py::arg("enable"), "Enable/disable background frame (B-scan) subtraction for line-field OCT (CPU and CUDA only)")
+			}, py::arg("enable"), "Enable/disable background frame (B-scan) subtraction for line-field OCT")
 
 			.def("enable_background_frame_normalization", [](ProcessorWrapper& self, bool enable) {
 				self.processor.enableBackgroundFrameNormalization(enable);
@@ -482,7 +482,7 @@ void register_processor(py::module& m) {
 
 			.def("enable_post_fft_frame_correction", [](ProcessorWrapper& self, bool enable) {
 				self.processor.enablePostFftFrameCorrection(enable);
-			}, py::arg("enable"), "Enable/disable post-FFT frame correction (divide A-scans by sqrt of their pre-subtraction spectral average; CPU and CUDA only)")
+			}, py::arg("enable"), "Enable/disable post-FFT frame correction (divide A-scans by sqrt of their pre-subtraction spectral average)")
 
 			// ============================================
 			// BACKEND-SPECIFIC SETTINGS

@@ -42,7 +42,7 @@ const float BENCHMARK_DISPERSION_FACTOR = 1.0f;
 const float BENCHMARK_GRAYSCALE_MIN = 30.0f;
 const float BENCHMARK_GRAYSCALE_MAX = 100.0f;
 
-// Line-field OCT features (applied on CPU and CUDA backends only)
+// Line-field OCT features
 const bool BENCHMARK_BACKGROUND_FRAME_SUBTRACTION = false;
 const bool BENCHMARK_POST_FFT_FRAME_CORRECTION = false;
 
@@ -118,7 +118,7 @@ std::string buildProcessingSummary() {
 	   << windowName(BENCHMARK_WINDOW_TYPE) << " window, dispersion compensation, FFT, log scaling ("
 	   << BENCHMARK_GRAYSCALE_MIN << "-" << BENCHMARK_GRAYSCALE_MAX << ").\n"
 	   << "Disabled: background removal, fixed pattern noise removal, post-process background subtraction, B-scan flip.\n"
-	   << "Line-field (CPU/CUDA only): background frame subtraction "
+	   << "Line-field: background frame subtraction "
 	   << (BENCHMARK_BACKGROUND_FRAME_SUBTRACTION ? "enabled" : "disabled")
 	   << ", post-FFT frame correction "
 	   << (BENCHMARK_POST_FFT_FRAME_CORRECTION ? "enabled" : "disabled") << ".";
@@ -256,18 +256,14 @@ void configureBenchmarkProcessor(ope::Processor& processor, int signalLength, in
 	processor.setGrayscaleRange(BENCHMARK_GRAYSCALE_MIN, BENCHMARK_GRAYSCALE_MAX);
 	processor.enableBscanFlip(false);
 
-	// Line-field OCT features throw when enabled on unsupported backends. A synthetic
-	// mid-level background frame is set so the subtraction stage actually executes
-	bool lineFieldSupported = (processor.getBackend() == ope::Backend::CPU ||
-	                           processor.getBackend() == ope::Backend::CUDA);
-	if (lineFieldSupported) {
-		if (BENCHMARK_BACKGROUND_FRAME_SUBTRACTION) {
-			std::vector<float> backgroundFrame(static_cast<size_t>(signalLength) * ascansPerBscan, 1000.0f);
-			processor.setBackgroundFrameProfile(backgroundFrame.data(), signalLength, ascansPerBscan);
-		}
-		processor.enableBackgroundFrameSubtraction(BENCHMARK_BACKGROUND_FRAME_SUBTRACTION);
-		processor.enablePostFftFrameCorrection(BENCHMARK_POST_FFT_FRAME_CORRECTION);
+	// Line-field OCT features. A synthetic mid-level background frame is set so the
+	// subtraction stage actually executes
+	if (BENCHMARK_BACKGROUND_FRAME_SUBTRACTION) {
+		std::vector<float> backgroundFrame(static_cast<size_t>(signalLength) * ascansPerBscan, 1000.0f);
+		processor.setBackgroundFrameProfile(backgroundFrame.data(), signalLength, ascansPerBscan);
 	}
+	processor.enableBackgroundFrameSubtraction(BENCHMARK_BACKGROUND_FRAME_SUBTRACTION);
+	processor.enablePostFftFrameCorrection(BENCHMARK_POST_FFT_FRAME_CORRECTION);
 }
 
 bool runBenchmarkPreset(

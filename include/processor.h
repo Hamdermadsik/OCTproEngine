@@ -234,7 +234,6 @@ public:
 	void enablePostProcessBackgroundSubtraction(bool enable); 
 	
 	// Background frame (B-scan) subtraction for line-field OCT
-	// Only supported on the CPU and CUDA backends; enabling on other backends throws
 	void enableBackgroundFrameSubtraction(bool enable);
 	void enableBackgroundFrameNormalization(bool enable);
 	void setBackgroundFrameBscansToAverage(int bscansToAverage);
@@ -252,7 +251,6 @@ public:
 	void loadBackgroundFrameProfileFromFile(const std::string& filepath);
 
 	// Post-FFT frame correction for line-field OCT
-	// Only supported on the CPU and CUDA backends; enabling on other backends throws
 	void enablePostFftFrameCorrection(bool enable);
 
 	// Other toggles
