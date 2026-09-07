@@ -508,7 +508,6 @@ struct VulkanBackend::Impl {
 	int backgroundBscansToProcessBake = 0;       // values baked into the recorded commands
 	bool backgroundFinalizeBake = false;
 	bool backgroundEmaBootstrapBake = false;
-	std::atomic<uint64_t> backgroundFinalizeSignalValue{0};  // completion thread reads the staging frame at this value
 
 	// Shader modules (will be created later)
 	std::vector<VkShaderModule> shaderModules;
@@ -716,26 +715,6 @@ struct VulkanBackend::Impl {
 					this->config.setFixedPatternNoiseProfile(
 						this->recordedFixedPatternNoise
 					);
-				}
-			}
-
-			// Line-field OCT: deferred background frame finalization. The recorded commands
-			// finalized the frame on-GPU and copied it to the staging buffer; once the
-			// completing buffer's timeline value is reached, read it back and sync it
-			{
-				uint64_t finalizeValue = this->backgroundFinalizeSignalValue.load(std::memory_order_acquire);
-				if (finalizeValue != 0 && work.timelineValue >= finalizeValue) {
-					size_t samplesPerBscan = static_cast<size_t>(this->signalLength) * this->ascansPerBscan;
-					this->recordedBackgroundFrame.resize(samplesPerBscan);
-					std::memcpy(this->recordedBackgroundFrame.data(),
-					            this->backgroundFrameStagingMapped,
-					            samplesPerBscan * sizeof(float));
-
-					// Sync to configuration so the profile survives backend switches
-					this->config.setBackgroundFrameProfile(
-						this->recordedBackgroundFrame, this->signalLength, this->ascansPerBscan);
-
-					this->backgroundFinalizeSignalValue.store(0, std::memory_order_release);
 				}
 			}
 
@@ -2360,7 +2339,6 @@ void VulkanBackend::initialize(const ProcessorConfiguration& config) {
 	this->impl->backgroundBscansToProcessBake = 0;
 	this->impl->backgroundFinalizeBake = false;
 	this->impl->backgroundEmaBootstrapBake = false;
-	this->impl->backgroundFinalizeSignalValue.store(0, std::memory_order_release);
 	this->impl->smoothedFrameDirty = true;
 	this->impl->recordedBackgroundFrame.clear();
 	if (config.hasCustomBackgroundFrameProfile()) {
@@ -2668,6 +2646,7 @@ void VulkanBackend::process(IOBuffer& input) {
 
 	// Line-field OCT boundary state transitions take effect for the NEXT buffer: this
 	// buffer's commands were recorded above with the boundary values baked in
+	bool publishRecordedFrameAfterSubmit = false;
 	if (this->impl->backgroundFinalizeBake) {
 		this->impl->backgroundFinalizeBake = false;
 		this->impl->backgroundBscansToProcessBake = 0;
@@ -2679,8 +2658,7 @@ void VulkanBackend::process(IOBuffer& input) {
 		const ProcessorConfiguration::ProcessingParameters::BackgroundFrame& finalizedBf =
 			this->impl->config.processingParams.backgroundFrame;
 		this->impl->smoothedFrameDirty = !(finalizedBf.enabled && finalizedBf.smoothSpectra);
-		// The completion thread reads the finalized frame at this buffer's timeline value
-		this->impl->backgroundFinalizeSignalValue.store(this->impl->nextOutputSignalValue, std::memory_order_release);
+		publishRecordedFrameAfterSubmit = true;
 		this->impl->needRerecordAfterBgCapture.store(true, std::memory_order_release);
 	}
 	if (this->impl->backgroundEmaBootstrapBake) {
@@ -2876,6 +2854,30 @@ void VulkanBackend::process(IOBuffer& input) {
 
 	// Track which timeline value was used by this CB (for slot reuse protection)
 	this->impl->lastTimelineValuePerCB[idx] = signalValue;
+
+	// Line-field OCT: recording completed with this buffer. Publish the finalized frame
+	// synchronously: the recorded commands copied it to the staging buffer, so wait for
+	// this buffer's timeline value and read it back. This blocks once per recording only
+	// and keeps the host mirror and configuration serialized by submitMutex - no state is
+	// shared with the completion thread
+	if (publishRecordedFrameAfterSubmit) {
+		VkSemaphoreWaitInfo finalizeWaitInfo = {};
+		finalizeWaitInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+		finalizeWaitInfo.semaphoreCount = 1;
+		finalizeWaitInfo.pSemaphores = &this->impl->outputOrderingSemaphore;
+		finalizeWaitInfo.pValues = &signalValue;
+		checkVulkanErrors(vkWaitSemaphores(this->impl->device, &finalizeWaitInfo, UINT64_MAX));
+
+		size_t samplesPerBscan = static_cast<size_t>(this->impl->signalLength) * this->impl->ascansPerBscan;
+		this->impl->recordedBackgroundFrame.resize(samplesPerBscan);
+		std::memcpy(this->impl->recordedBackgroundFrame.data(),
+		            this->impl->backgroundFrameStagingMapped,
+		            samplesPerBscan * sizeof(float));
+
+		// Sync to configuration so the profile survives backend switches
+		this->impl->config.setBackgroundFrameProfile(
+			this->impl->recordedBackgroundFrame, this->impl->signalLength, this->impl->ascansPerBscan);
+	}
 }
 
 // ============================================
@@ -3812,7 +3814,6 @@ void VulkanBackend::resetBackgroundFrame() {
 	this->impl->backgroundBscansToProcessBake = 0;
 	this->impl->backgroundFinalizeBake = false;
 	this->impl->backgroundEmaBootstrapBake = false;
-	this->impl->backgroundFinalizeSignalValue.store(0, std::memory_order_release);
 	this->impl->smoothedFrameDirty = true;
 	this->impl->commandBuffersValid = false;
 }
