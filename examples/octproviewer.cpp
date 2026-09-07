@@ -20,6 +20,8 @@
 #include "octproviewer_benchmark.h"
 #include <iostream>
 #include <fstream>
+#include <sstream>
+#include <string>
 #include <vector>
 #include <cstring>
 #include <mutex>
@@ -36,6 +38,12 @@ struct ProcessingParams {
 	bool resampling = false;
 	int interpolationMethod = 0;  // 0=LINEAR, 1=CUBIC, 2=LANCZOS
 	float resamplingCoeffs[4] = {0.0f, 2048.0f, -100.0f, 50.0f};
+
+	// Custom resampling curve (LUT) loaded from CSV, used instead of the polynomial
+	bool useCustomResamplingLut = false;
+	char resamplingLutPath[512] = "";
+	std::vector<float> resamplingLut;
+	std::string resamplingLutStatus;
 
 	bool windowing = false;
 	int windowType = 0;
@@ -125,6 +133,43 @@ struct AppState {
 // ============================================================================
 // Utility Functions
 // ============================================================================
+
+// Loads a resampling curve from CSV. Accepts the OCTproEngine format ("index,value"
+// rows with optional '#' comment lines) as well as a plain one-value-per-line file.
+bool loadResamplingLutCsv(const char* path, std::vector<float>& out, std::string& status) {
+	out.clear();
+	std::ifstream file(path);
+	if (!file.is_open()) {
+		status = "Could not open file";
+		return false;
+	}
+
+	std::string line;
+	while (std::getline(file, line)) {
+		if (line.empty() || line[0] == '#') continue;
+
+		std::string first, second;
+		std::istringstream iss(line);
+		std::getline(iss, first, ',');
+		bool hasSecond = static_cast<bool>(std::getline(iss, second, ','));
+
+		// Value is the second column when present, otherwise the only column
+		const std::string& field = hasSecond ? second : first;
+		try {
+			out.push_back(std::stof(field));
+		} catch (const std::exception&) {
+			continue;  // skips the "index,value" header and any malformed row
+		}
+	}
+
+	if (out.empty()) {
+		status = "No values found in file";
+		return false;
+	}
+
+	status = "Loaded " + std::to_string(out.size()) + " values";
+	return true;
+}
 
 std::vector<unsigned char> rotateImage90CCW(const unsigned char* input, int width, int height) {
 	std::vector<unsigned char> output(width * height);
@@ -221,7 +266,11 @@ void onProcessedData(const ope::IOBuffer& output, AppState* state) {
 void applyProcessingParams(ope::Processor* proc, const ProcessingParams& params) {
 	proc->enableResampling(params.resampling);
 	proc->setInterpolationMethod(static_cast<ope::InterpolationMethod>(params.interpolationMethod));
-	proc->setResamplingCoefficients(params.resamplingCoeffs);
+	if (params.useCustomResamplingLut && !params.resamplingLut.empty()) {
+		proc->setCustomResamplingCurve(params.resamplingLut.data(), params.resamplingLut.size());
+	} else {
+		proc->setResamplingCoefficients(params.resamplingCoeffs);
+	}
 
 	proc->enableWindowing(params.windowing);
 	proc->setWindowParameters(
@@ -683,11 +732,31 @@ void renderProcessingUI(AppState* state) {
 	if (ImGui::Combo("Interpolation", &pp.interpolationMethod, interp, 3)) {
 		if (state->autoUpdate) reprocessData(state);
 	}
-	ImGui::Text("Resampling Coefficients (c0 + c1*k + c2*k^2 + c3*k^3):");
-	for (int i = 0; i < 4; ++i) {
-		char label[8];
-		snprintf(label, sizeof(label), "c%d", i);
-		InputFloatWithReprocess(label, &pp.resamplingCoeffs[i], state);
+	CheckboxWithReprocess("Use Custom Curve (CSV)", &pp.useCustomResamplingLut, state);
+
+	if (pp.useCustomResamplingLut) {
+		ImGui::InputText("Curve File", pp.resamplingLutPath, sizeof(pp.resamplingLutPath));
+		if (ImGui::Button("Load Curve", ImVec2(-1, 0))) {
+			if (loadResamplingLutCsv(pp.resamplingLutPath, pp.resamplingLut, pp.resamplingLutStatus)) {
+				if (state->autoUpdate) reprocessData(state);
+			}
+		}
+		if (!pp.resamplingLutStatus.empty()) {
+			ImGui::TextUnformatted(pp.resamplingLutStatus.c_str());
+		}
+		if (!pp.resamplingLut.empty() &&
+		    static_cast<int>(pp.resamplingLut.size()) != state->dataParams.samplesPerAscan) {
+			ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f),
+				"Warning: curve has %d values, expected %d (will be padded/truncated)",
+				static_cast<int>(pp.resamplingLut.size()), state->dataParams.samplesPerAscan);
+		}
+	} else {
+		ImGui::Text("Resampling Coefficients (c0 + c1*k + c2*k^2 + c3*k^3):");
+		for (int i = 0; i < 4; ++i) {
+			char label[8];
+			snprintf(label, sizeof(label), "c%d", i);
+			InputFloatWithReprocess(label, &pp.resamplingCoeffs[i], state);
+		}
 	}
 
 	ImGui::SeparatorText("Windowing");

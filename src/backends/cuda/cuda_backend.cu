@@ -810,11 +810,9 @@ void CudaBackend::process(IOBuffer& input) {
 	// For zero-copy mode on Jetson, return the input buffer
 #ifdef __aarch64__
 	if (this->impl->enableZeroCopy) {
-		int idx = this->impl->nextCallbackIndex.fetch_add(1, std::memory_order_relaxed) %
-		          static_cast<int>(this->impl->callbackDataPool.size());
-		Impl::CallbackData* returnData = &this->impl->callbackDataPool[idx];
-		returnData->inputBuffer = &input;
-		checkCudaErrors(cudaLaunchHostFunc(stream, returnBufferCallback, returnData));
+		Impl::InputCallbackData* returnData = &this->impl->inputCallbackDataPool[this->impl->currentBuffer];
+    		returnData->inputBuffer = &input;
+    		checkCudaErrors(cudaLaunchHostFunc(stream, returnBufferCallback, returnData));  
 	}
 #endif
 
